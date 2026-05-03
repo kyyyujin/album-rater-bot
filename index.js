@@ -1,13 +1,13 @@
-const express = require('express');
-const multer  = require('multer');
-const fetch   = require('node-fetch');
+const express  = require('express');
+const multer   = require('multer');
+const fetch    = require('node-fetch');
 const FormData = require('form-data');
 
 const app    = express();
 const upload = multer({ storage: multer.memoryStorage() });
 
-const BOT_TOKEN  = process.env.BOT_TOKEN;
-const FORUM_ID   = process.env.FORUM_ID;
+const BOT_TOKEN = process.env.BOT_TOKEN;
+const FORUM_ID  = process.env.FORUM_ID;
 
 app.use((req, res, next) => {
   res.header('Access-Control-Allow-Origin', '*');
@@ -23,12 +23,11 @@ app.post('/post', upload.single('file'), async (req, res) => {
     if (!req.file) return res.status(400).json({ error: 'No image provided' });
     if (!title)    return res.status(400).json({ error: 'No title provided' });
 
-    // Build multipart form for Discord
     const form = new FormData();
 
-    // Discord forum post payload
     const payload = {
-      name: title,          // thread title = album name
+      name: title,
+      auto_archive_duration: 1440,
       message: {
         content: `# ${title}`,
         attachments: [{ id: '0', filename: 'rating.png' }]
@@ -37,6 +36,8 @@ app.post('/post', upload.single('file'), async (req, res) => {
 
     form.append('payload_json', JSON.stringify(payload), { contentType: 'application/json' });
     form.append('files[0]', req.file.buffer, { filename: 'rating.png', contentType: 'image/png' });
+
+    console.log('Sending to forum channel:', FORUM_ID);
 
     const discordRes = await fetch(
       `https://discord.com/api/v10/channels/${FORUM_ID}/threads`,
@@ -51,15 +52,16 @@ app.post('/post', upload.single('file'), async (req, res) => {
     );
 
     const data = await discordRes.json();
+    console.log('Discord response status:', discordRes.status);
+    console.log('Discord response body:', JSON.stringify(data));
 
     if (!discordRes.ok) {
-      console.error('Discord error:', data);
       return res.status(500).json({ error: 'Discord API error', details: data });
     }
 
     res.json({ ok: true, thread: data.id });
   } catch (err) {
-    console.error(err);
+    console.error('Server error:', err);
     res.status(500).json({ error: err.message });
   }
 });
@@ -68,4 +70,4 @@ app.get('/', (req, res) => res.send('Album Rater Bot — OK'));
 
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => console.log(`Server running on port ${PORT}`));
-      
+                
