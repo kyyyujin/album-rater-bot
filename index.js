@@ -3,6 +3,7 @@ const multer    = require('multer');
 const fetch     = require('node-fetch');
 const FormData  = require('form-data');
 const sharp     = require('sharp');
+const { Client, GatewayIntentBits } = require('discord.js');
 
 const app    = express();
 const upload = multer({ storage: multer.memoryStorage() });
@@ -11,9 +12,21 @@ const BOT_TOKEN    = process.env.BOT_TOKEN;
 const SUPABASE_URL = process.env.SUPABASE_URL;
 const SUPABASE_KEY = process.env.SUPABASE_KEY;
 
+// ── Discord gateway client (keeps bot online) ──
+const client = new Client({
+  intents: [GatewayIntentBits.Guilds]
+});
+
+client.once('ready', () => {
+  console.log(`Bot online: ${client.user.tag}`);
+  client.user.setActivity('rateando álbumes 🎵', { type: 'WATCHING' });
+});
+
+client.login(BOT_TOKEN);
+
 // Rate limit control for pfp changes (max 2/hour)
 let lastPfpChange = 0;
-const PFP_COOLDOWN_MS = 35 * 60 * 1000; // 35 minutes to be safe
+const PFP_COOLDOWN_MS = 35 * 60 * 1000;
 
 app.use((req, res, next) => {
   res.header('Access-Control-Allow-Origin', '*');
@@ -32,35 +45,17 @@ async function changeBotPfp(coverUrl) {
   }
 
   try {
-    // Download the cover image
     const imgRes = await fetch(coverUrl);
     if (!imgRes.ok) throw new Error('Failed to fetch cover image');
     const buffer = await imgRes.buffer();
 
-    // Resize and convert to PNG 512x512 — Discord's preferred format
     const processed = await sharp(buffer)
       .resize(512, 512, { fit: 'cover', position: 'centre' })
       .png()
       .toBuffer();
 
-    const base64  = processed.toString('base64');
-    const dataUri = `data:image/png;base64,${base64}`;
-
-    // Update bot pfp
-    const discordRes = await fetch('https://discord.com/api/v10/users/@me', {
-      method: 'PATCH',
-      headers: {
-        'Authorization': `Bot ${BOT_TOKEN}`,
-        'Content-Type': 'application/json'
-      },
-      body: JSON.stringify({ avatar: dataUri })
-    });
-
-    const data = await discordRes.json();
-    if (!discordRes.ok) {
-      console.error('PFP change failed:', JSON.stringify(data));
-      return;
-    }
+    // Use discord.js client to set avatar (more reliable)
+    await client.user.setAvatar(processed);
 
     lastPfpChange = now;
     console.log('Bot pfp updated successfully');
@@ -101,7 +96,7 @@ async function getRatings(user_id) {
   return res.json();
 }
 
-// ── POST /post — send to Discord + save to Supabase + change pfp ──
+// ── POST /post ──
 app.post('/post', upload.single('file'), async (req, res) => {
   try {
     const { title, thread_id, user_id, artist, cover_url, tracks, final_score, final_rank, notes } = req.body;
@@ -118,7 +113,6 @@ app.post('/post', upload.single('file'), async (req, res) => {
     form.append('payload_json', JSON.stringify(payload), { contentType: 'application/json' });
     form.append('files[0]', req.file.buffer, { filename: 'rating.png', contentType: 'image/png' });
 
-    console.log('Posting to thread:', thread_id);
     const discordRes = await fetch(
       `https://discord.com/api/v10/channels/${thread_id}/messages`,
       {
@@ -152,7 +146,7 @@ app.post('/post', upload.single('file'), async (req, res) => {
       }
     }
 
-    // 3. Change bot pfp to album cover (non-fatal, async)
+    // 3. Change bot pfp (non-fatal, async)
     if (cover_url) {
       changeBotPfp(cover_url).catch(e => console.error('PFP async error:', e));
     }
@@ -164,7 +158,7 @@ app.post('/post', upload.single('file'), async (req, res) => {
   }
 });
 
-// ── GET /history?user_id=xxx ──
+// ── GET /history ──
 app.get('/history', async (req, res) => {
   try {
     const { user_id } = req.query;
@@ -180,4 +174,4 @@ app.get('/', (req, res) => res.send('Album Rater Bot — OK'));
 
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => console.log(`Server running on port ${PORT}`));
-    
+                  
