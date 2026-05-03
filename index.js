@@ -2,6 +2,7 @@ const express   = require('express');
 const multer    = require('multer');
 const fetch     = require('node-fetch');
 const FormData  = require('form-data');
+const sharp     = require('sharp');
 
 const app    = express();
 const upload = multer({ storage: multer.memoryStorage() });
@@ -35,9 +36,15 @@ async function changeBotPfp(coverUrl) {
     const imgRes = await fetch(coverUrl);
     if (!imgRes.ok) throw new Error('Failed to fetch cover image');
     const buffer = await imgRes.buffer();
-    const contentType = imgRes.headers.get('content-type') || 'image/jpeg';
-    const base64 = buffer.toString('base64');
-    const dataUri = `data:${contentType};base64,${base64}`;
+
+    // Resize and convert to PNG 512x512 — Discord's preferred format
+    const processed = await sharp(buffer)
+      .resize(512, 512, { fit: 'cover', position: 'centre' })
+      .png()
+      .toBuffer();
+
+    const base64  = processed.toString('base64');
+    const dataUri = `data:image/png;base64,${base64}`;
 
     // Update bot pfp
     const discordRes = await fetch('https://discord.com/api/v10/users/@me', {
@@ -51,7 +58,7 @@ async function changeBotPfp(coverUrl) {
 
     const data = await discordRes.json();
     if (!discordRes.ok) {
-      console.error('PFP change failed:', data);
+      console.error('PFP change failed:', JSON.stringify(data));
       return;
     }
 
@@ -173,4 +180,4 @@ app.get('/', (req, res) => res.send('Album Rater Bot — OK'));
 
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => console.log(`Server running on port ${PORT}`));
-                
+    
