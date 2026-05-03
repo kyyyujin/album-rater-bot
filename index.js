@@ -7,7 +7,6 @@ const app    = express();
 const upload = multer({ storage: multer.memoryStorage() });
 
 const BOT_TOKEN = process.env.BOT_TOKEN;
-const THREAD_ID = process.env.THREAD_ID;
 
 app.use((req, res, next) => {
   res.header('Access-Control-Allow-Origin', '*');
@@ -19,9 +18,10 @@ app.use((req, res, next) => {
 
 app.post('/post', upload.single('file'), async (req, res) => {
   try {
-    const { title } = req.body;
-    if (!req.file) return res.status(400).json({ error: 'No image provided' });
-    if (!title)    return res.status(400).json({ error: 'No title provided' });
+    const { title, thread_id } = req.body;
+    if (!req.file)   return res.status(400).json({ error: 'No image provided' });
+    if (!title)      return res.status(400).json({ error: 'No title provided' });
+    if (!thread_id)  return res.status(400).json({ error: 'No thread_id provided' });
 
     const form = new FormData();
 
@@ -33,10 +33,10 @@ app.post('/post', upload.single('file'), async (req, res) => {
     form.append('payload_json', JSON.stringify(payload), { contentType: 'application/json' });
     form.append('files[0]', req.file.buffer, { filename: 'rating.png', contentType: 'image/png' });
 
-    console.log('Posting to thread:', THREAD_ID);
+    console.log('Posting to thread:', thread_id);
 
     const discordRes = await fetch(
-      `https://discord.com/api/v10/channels/${THREAD_ID}/messages`,
+      `https://discord.com/api/v10/channels/${thread_id}/messages`,
       {
         method: 'POST',
         headers: {
@@ -66,3 +66,4 @@ app.get('/', (req, res) => res.send('Album Rater Bot — OK'));
 
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => console.log(`Server running on port ${PORT}`));
+        
