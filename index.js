@@ -7,7 +7,7 @@ const app    = express();
 const upload = multer({ storage: multer.memoryStorage() });
 
 const BOT_TOKEN = process.env.BOT_TOKEN;
-const FORUM_ID  = process.env.FORUM_ID;
+const THREAD_ID = process.env.THREAD_ID;
 
 app.use((req, res, next) => {
   res.header('Access-Control-Allow-Origin', '*');
@@ -26,21 +26,17 @@ app.post('/post', upload.single('file'), async (req, res) => {
     const form = new FormData();
 
     const payload = {
-      name: title,
-      auto_archive_duration: 1440,
-      message: {
-        content: `# ${title}`,
-        attachments: [{ id: '0', filename: 'rating.png' }]
-      }
+      content: `# ${title}`,
+      attachments: [{ id: '0', filename: 'rating.png' }]
     };
 
     form.append('payload_json', JSON.stringify(payload), { contentType: 'application/json' });
     form.append('files[0]', req.file.buffer, { filename: 'rating.png', contentType: 'image/png' });
 
-    console.log('Sending to forum channel:', FORUM_ID);
+    console.log('Posting to thread:', THREAD_ID);
 
     const discordRes = await fetch(
-      `https://discord.com/api/v10/channels/${FORUM_ID}/threads`,
+      `https://discord.com/api/v10/channels/${THREAD_ID}/messages`,
       {
         method: 'POST',
         headers: {
@@ -59,7 +55,7 @@ app.post('/post', upload.single('file'), async (req, res) => {
       return res.status(500).json({ error: 'Discord API error', details: data });
     }
 
-    res.json({ ok: true, thread: data.id });
+    res.json({ ok: true, message: data.id });
   } catch (err) {
     console.error('Server error:', err);
     res.status(500).json({ error: err.message });
@@ -70,4 +66,3 @@ app.get('/', (req, res) => res.send('Album Rater Bot — OK'));
 
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => console.log(`Server running on port ${PORT}`));
-                
