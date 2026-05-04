@@ -22,6 +22,10 @@ const commands = [
   new SlashCommandBuilder()
     .setName('historial')
     .setDescription('Muestra tus últimos ratings')
+    .addStringOption(opt =>
+      opt.setName('usuario')
+        .setDescription('Nombre de usuario (default: el tuyo)')
+        .setRequired(false))
     .addIntegerOption(opt =>
       opt.setName('cantidad')
         .setDescription('Cuántos mostrar (máx 10, default 5)')
@@ -29,7 +33,11 @@ const commands = [
 
   new SlashCommandBuilder()
     .setName('top')
-    .setDescription('Tus álbumes mejor rankeados')
+    .setDescription('Álbumes mejor rankeados')
+    .addStringOption(opt =>
+      opt.setName('usuario')
+        .setDescription('Nombre de usuario (default: el tuyo)')
+        .setRequired(false))
     .addIntegerOption(opt =>
       opt.setName('cantidad')
         .setDescription('Cuántos mostrar (máx 10, default 5)')
@@ -37,7 +45,11 @@ const commands = [
 
   new SlashCommandBuilder()
     .setName('stats')
-    .setDescription('Tus estadísticas generales de ratings'),
+    .setDescription('Estadísticas generales de ratings')
+    .addStringOption(opt =>
+      opt.setName('usuario')
+        .setDescription('Nombre de usuario (default: el tuyo)')
+        .setRequired(false)),
 ].map(c => c.toJSON());
 
 async function registerCommands() {
@@ -108,15 +120,16 @@ client.on('interactionCreate', async interaction => {
   await interaction.deferReply();
 
   if (interaction.commandName === 'historial') {
+    const usuario  = interaction.options.getString('usuario') || discordUsername;
     const cantidad = interaction.options.getInteger('cantidad') || 5;
     try {
-      const ratings = await getRatings(discordUsername, cantidad);
+      const ratings = await getRatings(usuario, cantidad);
       if (!ratings.length) {
         await interaction.editReply('No tenés ratings guardados todavía.');
         return;
       }
       const embed = new EmbedBuilder()
-        .setTitle(`📚 Historial de ${discordUsername}`)
+        .setTitle(`📚 Historial de ${usuario}`)
         .setColor(0x5865f2)
         .setDescription(ratings.map((r, i) =>
           `**${i+1}.** ${r.album_title}${r.artist ? ` — ${r.artist}` : ''}\n` +
@@ -131,9 +144,10 @@ client.on('interactionCreate', async interaction => {
   }
 
   if (interaction.commandName === 'top') {
+    const usuario  = interaction.options.getString('usuario') || discordUsername;
     const cantidad = interaction.options.getInteger('cantidad') || 5;
     try {
-      const all = await getRatings(discordUsername);
+      const all = await getRatings(usuario);
       if (!all.length) {
         await interaction.editReply('No tenés ratings guardados todavía.');
         return;
@@ -144,7 +158,7 @@ client.on('interactionCreate', async interaction => {
         .slice(0, cantidad);
 
       const embed = new EmbedBuilder()
-        .setTitle(`🏆 Top ${sorted.length} de ${discordUsername}`)
+        .setTitle(`🏆 Top ${sorted.length} de ${usuario}`)
         .setColor(0xc8f060)
         .setDescription(sorted.map((r, i) => {
           const medals = ['🥇','🥈','🥉'];
@@ -160,8 +174,9 @@ client.on('interactionCreate', async interaction => {
   }
 
   if (interaction.commandName === 'stats') {
+    const usuario = interaction.options.getString('usuario') || discordUsername;
     try {
-      const all = await getRatings(discordUsername);
+      const all = await getRatings(usuario);
       if (!all.length) {
         await interaction.editReply('No tenés ratings guardados todavía.');
         return;
@@ -180,7 +195,7 @@ client.on('interactionCreate', async interaction => {
         .join('  ·  ');
 
       const embed = new EmbedBuilder()
-        .setTitle(`📊 Stats de ${discordUsername}`)
+        .setTitle(`📊 Stats de ${usuario}`)
         .setColor(0x5865f2)
         .addFields(
           { name: '🎵 Total rateados', value: `${all.length} álbumes`, inline: true },
@@ -235,7 +250,7 @@ app.post('/post', upload.single('file'), async (req, res) => {
     if (!thread_id) return res.status(400).json({ error: 'No thread_id provided' });
 
     const form = new FormData();
-    form.append('payload_json', JSON.stringify({ content: '', attachments: [{ id: '0', filename: 'rating.png' }] }), { contentType: 'application/json' });
+    form.append('payload_json', JSON.stringify({ content: `# ${title}`, attachments: [{ id: '0', filename: 'rating.png' }] }), { contentType: 'application/json' });
     form.append('files[0]', req.file.buffer, { filename: 'rating.png', contentType: 'image/png' });
 
     const discordRes = await fetch(`https://discord.com/api/v10/channels/${thread_id}/messages`, {
@@ -286,4 +301,3 @@ app.get('/', (req, res) => res.send('Album Rater Bot — OK'));
 
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => console.log(`Server running on port ${PORT}`));
-    
