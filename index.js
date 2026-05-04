@@ -288,6 +288,32 @@ app.post('/post', upload.single('file'), async (req, res) => {
   }
 });
 
+app.post('/delete', express.json(), async (req, res) => {
+  try {
+    const { id, user_id } = req.body;
+    if (!id)      return res.status(400).json({ error: 'No id provided' });
+    if (!user_id) return res.status(400).json({ error: 'No user_id provided' });
+
+    // Only allow deleting own records
+    const delRes = await fetch(`${SUPABASE_URL}/rest/v1/ratings?id=eq.${encodeURIComponent(id)}&user_id=eq.${encodeURIComponent(user_id)}`, {
+      method: 'DELETE',
+      headers: {
+        'apikey': SUPABASE_KEY,
+        'Authorization': `Bearer ${SUPABASE_KEY}`,
+        'Prefer': 'return=representation'
+      }
+    });
+    if (!delRes.ok) {
+      const err = await delRes.json();
+      return res.status(500).json({ error: 'Supabase error', details: err });
+    }
+    res.json({ ok: true });
+  } catch(err) {
+    console.error(err);
+    res.status(500).json({ error: err.message });
+  }
+});
+
 app.post('/save', upload.single('file'), async (req, res) => {
   try {
     const { title, user_id, artist, cover_url, tracks, final_score, final_rank, notes } = req.body;
@@ -329,4 +355,4 @@ app.get('/', (req, res) => res.send('Album Rater Bot — OK'));
 
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => console.log(`Server running on port ${PORT}`));
-      
+                  
