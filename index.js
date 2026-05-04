@@ -288,6 +288,34 @@ app.post('/post', upload.single('file'), async (req, res) => {
   }
 });
 
+app.post('/save', upload.single('file'), async (req, res) => {
+  try {
+    const { title, user_id, artist, cover_url, tracks, final_score, final_rank, notes } = req.body;
+    if (!req.file)  return res.status(400).json({ error: 'No image provided' });
+    if (!title)     return res.status(400).json({ error: 'No title provided' });
+    if (!user_id)   return res.status(400).json({ error: 'No user_id provided' });
+
+    const cleanTitle = req.body.album_title || title;
+    await saveRating({
+      user_id,
+      album_title: cleanTitle,
+      artist:      artist      || null,
+      cover_url:   cover_url   || null,
+      year:        req.body.year  || null,
+      genre:       req.body.genre || null,
+      tracks:      tracks ? JSON.parse(tracks) : null,
+      final_score: final_score ? parseFloat(final_score) : null,
+      final_rank:  final_rank  || null,
+      notes:       notes       || null
+    });
+
+    res.json({ ok: true });
+  } catch(err) {
+    console.error(err);
+    res.status(500).json({ error: err.message });
+  }
+});
+
 app.get('/history', async (req, res) => {
   try {
     const data = await getRatings(req.query.user_id);
@@ -301,3 +329,4 @@ app.get('/', (req, res) => res.send('Album Rater Bot — OK'));
 
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => console.log(`Server running on port ${PORT}`));
+      
