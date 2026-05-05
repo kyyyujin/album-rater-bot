@@ -351,8 +351,61 @@ app.get('/history', async (req, res) => {
   }
 });
 
+// ── Spotify streams: save (upsert) ──
+app.post('/spotify-save', express.json({ limit: '50mb' }), async (req, res) => {
+  try {
+    const { user_id, streams } = req.body;
+    if (!user_id) return res.status(400).json({ error: 'No user_id provided' });
+    if (!streams) return res.status(400).json({ error: 'No streams provided' });
+
+    const upsertRes = await fetch(`${SUPABASE_URL}/rest/v1/spotify_streams`, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        'apikey': SUPABASE_KEY,
+        'Authorization': `Bearer ${SUPABASE_KEY}`,
+        'Prefer': 'resolution=merge-duplicates,return=minimal'
+      },
+      body: JSON.stringify({
+        user_id,
+        streams,
+        last_sync: new Date().toISOString(),
+        updated_at: new Date().toISOString()
+      })
+    });
+
+    if (!upsertRes.ok) {
+      const err = await upsertRes.json();
+      return res.status(500).json({ error: 'Supabase error', details: err });
+    }
+    res.json({ ok: true });
+  } catch(err) {
+    console.error(err);
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// ── Spotify streams: load ──
+app.get('/spotify-load', async (req, res) => {
+  try {
+    const { user_id } = req.query;
+    if (!user_id) return res.status(400).json({ error: 'No user_id provided' });
+
+    const loadRes = await fetch(
+      `${SUPABASE_URL}/rest/v1/spotify_streams?user_id=eq.${encodeURIComponent(user_id)}&limit=1`,
+      { headers: { 'apikey': SUPABASE_KEY, 'Authorization': `Bearer ${SUPABASE_KEY}` } }
+    );
+    const data = await loadRes.json();
+    if (!data.length) return res.json({ streams: null });
+    res.json({ streams: data[0].streams, last_sync: data[0].last_sync });
+  } catch(err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
 app.get('/', (req, res) => res.send('Album Rater Bot — OK'));
 
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => console.log(`Server running on port ${PORT}`));
-                  
+
+    
