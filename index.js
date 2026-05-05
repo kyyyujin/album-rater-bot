@@ -376,6 +376,7 @@ app.post('/spotify-save', express.json({ limit: '10mb' }), async (req, res) => {
     console.log(`[spotify-save] buffered chunk ${chunk + 1}/${total_chunks} (${received} received)`);
 
     if (received < total_chunks) {
+      // Not all chunks yet — just acknowledge, don't touch Supabase
       return res.json({ ok: true, buffered: true, received, total: total_chunks });
     }
 
@@ -440,4 +441,4 @@ app.get('/', (req, res) => res.send('Album Rater Bot — OK'));
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => console.log(`Server running on port ${PORT}`));
 
-        
+                
