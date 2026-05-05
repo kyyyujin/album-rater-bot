@@ -352,85 +352,72 @@ app.get('/history', async (req, res) => {
 });
 
 // ── Spotify streams: save (upsert) ──
-// ── Spotify streams: chunked upload buffer ──
-const spChunkBuffer = {}; // { user_id: { chunks: [], total } }
-
+// ── Spotify streams: save chunks directly to Supabase ──
 app.post('/spotify-save', express.json({ limit: '10mb' }), async (req, res) => {
   try {
     const { user_id, streams, chunk, total_chunks } = req.body;
     if (!user_id) return res.status(400).json({ error: 'No user_id provided' });
     if (!streams) return res.status(400).json({ error: 'No streams provided' });
 
-    console.log(`[spotify-save] user=${user_id} chunk=${chunk ?? 'single'} total=${total_chunks ?? 1} streams=${Array.isArray(streams) ? streams.length : '?'}`);
+    const chunkIndex = chunk ?? 0;
+    console.log(`[spotify-save] user=${user_id} chunk=${chunkIndex} total=${total_chunks ?? 1} streams=${Array.isArray(streams) ? streams.length : '?'}`);
 
-    // Single upload (no chunking)
-    if (chunk === undefined || total_chunks === undefined || total_chunks === 1) {
-      return await saveStreams(user_id, streams, res);
+    // If this is the first chunk, delete old data first
+    if (chunkIndex === 0) {
+      await fetch(`${SUPABASE_URL}/rest/v1/spotify_streams?user_id=eq.${encodeURIComponent(user_id)}`, {
+        method: 'DELETE',
+        headers: { 'apikey': SUPABASE_KEY, 'Authorization': `Bearer ${SUPABASE_KEY}` }
+      });
+      console.log(`[spotify-save] cleared old data for ${user_id}`);
     }
 
-    // Chunked upload — buffer until all chunks arrive
-    if (!spChunkBuffer[user_id]) spChunkBuffer[user_id] = { chunks: [], total: total_chunks };
-    spChunkBuffer[user_id].chunks[chunk] = streams;
+    // Save this chunk as its own row
+    const upsertRes = await fetch(`${SUPABASE_URL}/rest/v1/spotify_streams`, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        'apikey': SUPABASE_KEY,
+        'Authorization': `Bearer ${SUPABASE_KEY}`,
+        'Prefer': 'resolution=merge-duplicates,return=minimal'
+      },
+      body: JSON.stringify({
+        user_id,
+        chunk_index: chunkIndex,
+        streams,
+        updated_at: new Date().toISOString()
+      })
+    });
 
-    const received = spChunkBuffer[user_id].chunks.filter(Boolean).length;
-    console.log(`[spotify-save] buffered chunk ${chunk + 1}/${total_chunks} (${received} received)`);
+    const rawText = await upsertRes.text();
+    console.log(`[spotify-save] Supabase status=${upsertRes.status}`);
 
-    if (received < total_chunks) {
-      // Not all chunks yet — just acknowledge, don't touch Supabase
-      return res.json({ ok: true, buffered: true, received, total: total_chunks });
+    if (!upsertRes.ok) {
+      return res.status(500).json({ error: 'Supabase error', status: upsertRes.status, body: rawText.slice(0, 300) });
     }
-
-    // All chunks received — merge and save
-    const allStreams = spChunkBuffer[user_id].chunks.flat();
-    delete spChunkBuffer[user_id];
-    console.log(`[spotify-save] all chunks received, saving ${allStreams.length} streams`);
-    return await saveStreams(user_id, allStreams, res);
-
+    res.json({ ok: true });
   } catch(err) {
     console.error('[spotify-save] error:', err);
     res.status(500).json({ error: err.message });
   }
 });
 
-async function saveStreams(user_id, streams, res) {
-  const upsertRes = await fetch(`${SUPABASE_URL}/rest/v1/spotify_streams`, {
-    method: 'POST',
-    headers: {
-      'Content-Type': 'application/json',
-      'apikey': SUPABASE_KEY,
-      'Authorization': `Bearer ${SUPABASE_KEY}`,
-      'Prefer': 'resolution=merge-duplicates,return=minimal'
-    },
-    body: JSON.stringify({
-      user_id,
-      streams,
-      last_sync: new Date().toISOString(),
-      updated_at: new Date().toISOString()
-    })
-  });
-
-  const rawText = await upsertRes.text();
-  console.log(`[spotify-save] Supabase status=${upsertRes.status} body=${rawText.slice(0, 300)}`);
-
-  if (!upsertRes.ok) {
-    return res.status(500).json({ error: 'Supabase error', status: upsertRes.status, body: rawText.slice(0, 500) });
-  }
-  return res.json({ ok: true });
-}
-
-// ── Spotify streams: load ──
+// ── Spotify streams: load all chunks and merge ──
 app.get('/spotify-load', async (req, res) => {
   try {
     const { user_id } = req.query;
     if (!user_id) return res.status(400).json({ error: 'No user_id provided' });
 
     const loadRes = await fetch(
-      `${SUPABASE_URL}/rest/v1/spotify_streams?user_id=eq.${encodeURIComponent(user_id)}&limit=1`,
+      `${SUPABASE_URL}/rest/v1/spotify_streams?user_id=eq.${encodeURIComponent(user_id)}&order=chunk_index.asc`,
       { headers: { 'apikey': SUPABASE_KEY, 'Authorization': `Bearer ${SUPABASE_KEY}` } }
     );
     const data = await loadRes.json();
     if (!data.length) return res.json({ streams: null });
-    res.json({ streams: data[0].streams, last_sync: data[0].last_sync });
+
+    // Merge all chunks
+    const allStreams = data.flatMap(row => row.streams);
+    console.log(`[spotify-load] user=${user_id} chunks=${data.length} total=${allStreams.length}`);
+    res.json({ streams: allStreams });
   } catch(err) {
     res.status(500).json({ error: err.message });
   }
@@ -441,4 +428,4 @@ app.get('/', (req, res) => res.send('Album Rater Bot — OK'));
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => console.log(`Server running on port ${PORT}`));
 
-                
+      
