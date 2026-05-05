@@ -358,6 +358,8 @@ app.post('/spotify-save', express.json({ limit: '50mb' }), async (req, res) => {
     if (!user_id) return res.status(400).json({ error: 'No user_id provided' });
     if (!streams) return res.status(400).json({ error: 'No streams provided' });
 
+    console.log(`[spotify-save] user=${user_id} streams=${Array.isArray(streams) ? streams.length : '?'}`);
+
     const upsertRes = await fetch(`${SUPABASE_URL}/rest/v1/spotify_streams`, {
       method: 'POST',
       headers: {
@@ -374,13 +376,15 @@ app.post('/spotify-save', express.json({ limit: '50mb' }), async (req, res) => {
       })
     });
 
+    const rawText = await upsertRes.text();
+    console.log(`[spotify-save] Supabase status=${upsertRes.status} body=${rawText.slice(0, 300)}`);
+
     if (!upsertRes.ok) {
-      const err = await upsertRes.json();
-      return res.status(500).json({ error: 'Supabase error', details: err });
+      return res.status(500).json({ error: 'Supabase error', status: upsertRes.status, body: rawText.slice(0, 500) });
     }
     res.json({ ok: true });
   } catch(err) {
-    console.error(err);
+    console.error('[spotify-save] error:', err);
     res.status(500).json({ error: err.message });
   }
 });
@@ -408,4 +412,4 @@ app.get('/', (req, res) => res.send('Album Rater Bot — OK'));
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => console.log(`Server running on port ${PORT}`));
 
-                                   
+      
