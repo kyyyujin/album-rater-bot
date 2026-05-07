@@ -250,7 +250,7 @@ app.post('/post', upload.single('file'), async (req, res) => {
     if (!thread_id) return res.status(400).json({ error: 'No thread_id provided' });
 
     const form = new FormData();
-    form.append('payload_json', JSON.stringify({ content: `# ${title}`, attachments: [{ id: '0', filename: 'rating.png' }] }), { contentType: 'application/json' });
+    form.append('payload_json', JSON.stringify({ attachments: [{ id: '0', filename: 'rating.png' }] }), { contentType: 'application/json' });
     form.append('files[0]', req.file.buffer, { filename: 'rating.png', contentType: 'image/png' });
 
     const discordRes = await fetch(`https://discord.com/api/v10/channels/${thread_id}/messages`, {
