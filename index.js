@@ -532,4 +532,34 @@ app.post('/register', express.json(), async (req, res) => {
 // ── Auth: login ──
 app.post('/login', express.json(), async (req, res) => {
   try {
-    const
+    const { username, password } = req.body;
+    if (!username || !password) return res.status(400).json({ error: 'Faltan datos' });
+
+    const user = await getUser(username);
+    if (!user) return res.status(401).json({ error: 'Usuario o contraseña incorrectos' });
+
+    const match = await bcrypt.compare(password, user.password_hash);
+    if (!match) return res.status(401).json({ error: 'Usuario o contraseña incorrectos' });
+
+    const token = generateToken(username);
+    res.json({ ok: true, token, username });
+  } catch(err) {
+    console.error('[login]', err.message);
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// ── Auth: verify token ──
+app.post('/verify', express.json(), async (req, res) => {
+  const { token } = req.body;
+  const username = verifyToken(token);
+  if (!username) return res.status(401).json({ error: 'Sesión inválida o expirada' });
+  res.json({ ok: true, username });
+});
+
+app.get('/', (req, res) => res.send('Album Rater Bot — OK'));
+
+const PORT = process.env.PORT || 3000;
+app.listen(PORT, () => console.log(`Server running on port ${PORT}`));
+
+      
