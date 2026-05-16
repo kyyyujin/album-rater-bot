@@ -508,6 +508,22 @@ app.post('/admin-delete', express.json(), async (req, res) => {
   }
 });
 
+// ── Public: random covers for login bg ──
+app.get('/covers', async (req, res) => {
+  try {
+    const r = await fetch(`${SUPABASE_URL}/rest/v1/ratings?select=cover_url&limit=100&order=created_at.desc`, {
+      headers: { 'apikey': SUPABASE_KEY, 'Authorization': `Bearer ${SUPABASE_KEY}` }
+    });
+    const data = await r.json();
+    const covers = [...new Set(data.map(row => row.cover_url).filter(Boolean))];
+    // Shuffle and return up to 20
+    const shuffled = covers.sort(() => Math.random() - 0.5).slice(0, 20);
+    res.json({ covers: shuffled });
+  } catch(err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
 // ── Auth: register ──
 app.post('/register', express.json(), async (req, res) => {
   try {
