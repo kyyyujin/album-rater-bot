@@ -3,8 +3,6 @@ const multer    = require('multer');
 const fetch     = require('node-fetch');
 const FormData  = require('form-data');
 const sharp     = require('sharp');
-const bcrypt    = require('bcrypt');
-const crypto    = require('crypto');
 const { Client, GatewayIntentBits, REST, Routes, SlashCommandBuilder, EmbedBuilder } = require('discord.js');
 
 const app    = express();
@@ -14,48 +12,6 @@ const BOT_TOKEN    = process.env.BOT_TOKEN;
 const CLIENT_ID    = process.env.CLIENT_ID;
 const SUPABASE_URL = process.env.SUPABASE_URL;
 const SUPABASE_KEY = process.env.SUPABASE_KEY;
-const ADMIN_USER   = 'kyujin';
-
-// ── In-memory token store { token -> { username, expires } } ──
-const sessions = {};
-
-function generateToken(username) {
-  const token = crypto.randomBytes(32).toString('hex');
-  sessions[token] = { username, expires: Date.now() + 1000 * 60 * 60 * 24 * 7 }; // 7 days
-  return token;
-}
-
-function verifyToken(token) {
-  const session = sessions[token];
-  if (!session) return null;
-  if (Date.now() > session.expires) { delete sessions[token]; return null; }
-  return session.username;
-}
-
-// ── Supabase user helpers ──
-async function getUser(username) {
-  const res = await fetch(`${SUPABASE_URL}/rest/v1/users?username=eq.${encodeURIComponent(username)}&limit=1`, {
-    headers: { 'apikey': SUPABASE_KEY, 'Authorization': `Bearer ${SUPABASE_KEY}` }
-  });
-  const data = await res.json();
-  return data[0] || null;
-}
-
-async function createUser(username, passwordHash) {
-  const res = await fetch(`${SUPABASE_URL}/rest/v1/users`, {
-    method: 'POST',
-    headers: {
-      'Content-Type': 'application/json',
-      'apikey': SUPABASE_KEY,
-      'Authorization': `Bearer ${SUPABASE_KEY}`,
-      'Prefer': 'return=representation'
-    },
-    body: JSON.stringify({ username, password_hash: passwordHash })
-  });
-  const data = await res.json();
-  if (!res.ok) throw new Error(JSON.stringify(data));
-  return data[0];
-}
 
 // ── Register slash commands ──
 const commands = [
@@ -117,19 +73,47 @@ async function getRatings(user_id, limit = null) {
 }
 
 async function saveRating(data) {
-  const res = await fetch(`${SUPABASE_URL}/rest/v1/ratings`, {
-    method: 'POST',
-    headers: {
-      'Content-Type': 'application/json',
-      'apikey': SUPABASE_KEY,
-      'Authorization': `Bearer ${SUPABASE_KEY}`,
-      'Prefer': 'return=representation'
-    },
-    body: JSON.stringify(data)
-  });
-  const json = await res.json();
-  if (!res.ok) throw new Error(JSON.stringify(json));
-  return json;
+  // First check if rating already exists for this user+album
+  const checkRes = await fetch(
+    `${SUPABASE_URL}/rest/v1/ratings?user_id=eq.${encodeURIComponent(data.user_id)}&album_title=eq.${encodeURIComponent(data.album_title)}&select=id`,
+    {
+      headers: { 'apikey': SUPABASE_KEY, 'Authorization': `Bearer ${SUPABASE_KEY}` }
+    }
+  );
+  const existing = await checkRes.json();
+
+  if (existing.length > 0) {
+    // Update existing record
+    const id = existing[0].id;
+    const res = await fetch(`${SUPABASE_URL}/rest/v1/ratings?id=eq.${id}`, {
+      method: 'PATCH',
+      headers: {
+        'Content-Type': 'application/json',
+        'apikey': SUPABASE_KEY,
+        'Authorization': `Bearer ${SUPABASE_KEY}`,
+        'Prefer': 'return=representation'
+      },
+      body: JSON.stringify(data)
+    });
+    const json = await res.json();
+    if (!res.ok) throw new Error(JSON.stringify(json));
+    return json;
+  } else {
+    // Insert new record
+    const res = await fetch(`${SUPABASE_URL}/rest/v1/ratings`, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        'apikey': SUPABASE_KEY,
+        'Authorization': `Bearer ${SUPABASE_KEY}`,
+        'Prefer': 'return=representation'
+      },
+      body: JSON.stringify(data)
+    });
+    const json = await res.json();
+    if (!res.ok) throw new Error(JSON.stringify(json));
+    return json;
+  }
 }
 
 // ── Rank color helper ──
@@ -467,110 +451,39 @@ app.get('/spotify-load', async (req, res) => {
   }
 });
 
-// ── Admin: list all users ──
-app.get('/users', async (req, res) => {
+// ── Admin: clean duplicate ratings (keep latest per user+album) ──
+app.post('/clean-duplicates', express.json(), async (req, res) => {
   try {
-    const { requester } = req.query;
+    const { requester } = req.body;
     if (requester?.toLowerCase() !== 'kyujin') return res.status(403).json({ error: 'Forbidden' });
-    const r = await fetch(`${SUPABASE_URL}/rest/v1/ratings?select=user_id&order=user_id.asc`, {
+
+    const allRes = await fetch(`${SUPABASE_URL}/rest/v1/ratings?select=id,user_id,album_title,created_at&order=created_at.desc`, {
       headers: { 'apikey': SUPABASE_KEY, 'Authorization': `Bearer ${SUPABASE_KEY}` }
     });
-    const data = await r.json();
-    const users = [...new Set(data.map(row => row.user_id))].sort();
-    res.json({ users });
-  } catch(err) {
-    res.status(500).json({ error: err.message });
-  }
-});
+    const all = await allRes.json();
 
-// ── Admin: delete any user's rating ──
-app.post('/admin-delete', express.json(), async (req, res) => {
-  try {
-    const { id, target_user_id, requester } = req.body;
-    if (requester?.toLowerCase() !== 'kyujin') return res.status(403).json({ error: 'Forbidden' });
-    if (!id || !target_user_id) return res.status(400).json({ error: 'Missing id or target_user_id' });
-
-    const delRes = await fetch(`${SUPABASE_URL}/rest/v1/ratings?id=eq.${encodeURIComponent(id)}&user_id=eq.${encodeURIComponent(target_user_id)}`, {
-      method: 'DELETE',
-      headers: {
-        'apikey': SUPABASE_KEY,
-        'Authorization': `Bearer ${SUPABASE_KEY}`,
-        'Prefer': 'return=representation'
+    const seen = new Set();
+    const toDelete = [];
+    all.forEach(r => {
+      const key = `${r.user_id}|${r.album_title}`;
+      if (seen.has(key)) {
+        toDelete.push(r.id);
+      } else {
+        seen.add(key);
       }
     });
-    if (!delRes.ok) {
-      const err = await delRes.json();
-      return res.status(500).json({ error: 'Supabase error', details: err });
+
+    for (const id of toDelete) {
+      await fetch(`${SUPABASE_URL}/rest/v1/ratings?id=eq.${id}`, {
+        method: 'DELETE',
+        headers: { 'apikey': SUPABASE_KEY, 'Authorization': `Bearer ${SUPABASE_KEY}` }
+      });
     }
-    res.json({ ok: true });
+
+    res.json({ ok: true, deleted: toDelete.length });
   } catch(err) {
     res.status(500).json({ error: err.message });
   }
-});
-
-// ── Public: random covers for login bg ──
-app.get('/covers', async (req, res) => {
-  try {
-    const r = await fetch(`${SUPABASE_URL}/rest/v1/ratings?select=cover_url&limit=200&order=created_at.desc`, {
-      headers: { 'apikey': SUPABASE_KEY, 'Authorization': `Bearer ${SUPABASE_KEY}` }
-    });
-    const data = await r.json();
-    const covers = [...new Set(data.map(row => row.cover_url).filter(Boolean))];
-    // Shuffle and return up to 40
-    const shuffled = covers.sort(() => Math.random() - 0.5).slice(0, 40);
-    res.json({ covers: shuffled });
-  } catch(err) {
-    res.status(500).json({ error: err.message });
-  }
-});
-
-// ── Auth: register ──
-app.post('/register', express.json(), async (req, res) => {
-  try {
-    const { username, password } = req.body;
-    if (!username || !password) return res.status(400).json({ error: 'Faltan datos' });
-    if (username.length < 3) return res.status(400).json({ error: 'Username muy corto (mín 3 caracteres)' });
-    if (password.length < 6) return res.status(400).json({ error: 'Contraseña muy corta (mín 6 caracteres)' });
-
-    const existing = await getUser(username);
-    if (existing) return res.status(409).json({ error: 'Ese username ya está en uso' });
-
-    const hash  = await bcrypt.hash(password, 10);
-    await createUser(username, hash);
-    const token = generateToken(username);
-    res.json({ ok: true, token, username });
-  } catch(err) {
-    console.error('[register]', err.message);
-    res.status(500).json({ error: err.message });
-  }
-});
-
-// ── Auth: login ──
-app.post('/login', express.json(), async (req, res) => {
-  try {
-    const { username, password } = req.body;
-    if (!username || !password) return res.status(400).json({ error: 'Faltan datos' });
-
-    const user = await getUser(username);
-    if (!user) return res.status(401).json({ error: 'Usuario o contraseña incorrectos' });
-
-    const match = await bcrypt.compare(password, user.password_hash);
-    if (!match) return res.status(401).json({ error: 'Usuario o contraseña incorrectos' });
-
-    const token = generateToken(username);
-    res.json({ ok: true, token, username });
-  } catch(err) {
-    console.error('[login]', err.message);
-    res.status(500).json({ error: err.message });
-  }
-});
-
-// ── Auth: verify token ──
-app.post('/verify', express.json(), async (req, res) => {
-  const { token } = req.body;
-  const username = verifyToken(token);
-  if (!username) return res.status(401).json({ error: 'Sesión inválida o expirada' });
-  res.json({ ok: true, username });
 });
 
 app.get('/', (req, res) => res.send('Album Rater Bot — OK'));
