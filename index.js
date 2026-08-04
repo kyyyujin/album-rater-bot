@@ -486,6 +486,54 @@ app.post('/clean-duplicates', express.json(), async (req, res) => {
   }
 });
 
+// ── Public: random covers for login bg ──
+app.get('/covers', async (req, res) => {
+  try {
+    const r = await fetch(`${SUPABASE_URL}/rest/v1/ratings?select=cover_url&limit=200&order=created_at.desc`, {
+      headers: { 'apikey': SUPABASE_KEY, 'Authorization': `Bearer ${SUPABASE_KEY}` }
+    });
+    const data = await r.json();
+    const covers = [...new Set(data.map(row => row.cover_url).filter(Boolean))];
+    const shuffled = covers.sort(() => Math.random() - 0.5).slice(0, 40);
+    res.json({ covers: shuffled });
+  } catch(err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// ── Admin: list all users ──
+app.get('/users', async (req, res) => {
+  try {
+    const { requester } = req.query;
+    if (requester?.toLowerCase() !== 'kyujin') return res.status(403).json({ error: 'Forbidden' });
+    const r = await fetch(`${SUPABASE_URL}/rest/v1/ratings?select=user_id&order=user_id.asc`, {
+      headers: { 'apikey': SUPABASE_KEY, 'Authorization': `Bearer ${SUPABASE_KEY}` }
+    });
+    const data = await r.json();
+    const users = [...new Set(data.map(row => row.user_id))].sort();
+    res.json({ users });
+  } catch(err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// ── Admin: delete any user's rating ──
+app.post('/admin-delete', express.json(), async (req, res) => {
+  try {
+    const { id, target_user_id, requester } = req.body;
+    if (requester?.toLowerCase() !== 'kyujin') return res.status(403).json({ error: 'Forbidden' });
+    if (!id || !target_user_id) return res.status(400).json({ error: 'Missing id or target_user_id' });
+    const delRes = await fetch(`${SUPABASE_URL}/rest/v1/ratings?id=eq.${encodeURIComponent(id)}&user_id=eq.${encodeURIComponent(target_user_id)}`, {
+      method: 'DELETE',
+      headers: { 'apikey': SUPABASE_KEY, 'Authorization': `Bearer ${SUPABASE_KEY}`, 'Prefer': 'return=representation' }
+    });
+    if (!delRes.ok) return res.status(500).json({ error: 'Supabase error' });
+    res.json({ ok: true });
+  } catch(err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
 app.get('/', (req, res) => res.send('Album Rater Bot — OK'));
 
 // ── AUTH ──
