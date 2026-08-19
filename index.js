@@ -527,4 +527,106 @@ app.get('/users', async (req, res) => {
     const users = [...new Set(data.map(row => row.user_id))].sort();
     res.json({ users });
   } catch(err) {
-    res.status(500).json({ error: err.message
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// ── Admin: delete any user's rating ──
+app.post('/admin-delete', express.json(), async (req, res) => {
+  try {
+    const { id, target_user_id, requester } = req.body;
+    if (requester?.toLowerCase() !== 'kyujin') return res.status(403).json({ error: 'Forbidden' });
+    if (!id || !target_user_id) return res.status(400).json({ error: 'Missing id or target_user_id' });
+    const delRes = await fetch(`${SUPABASE_URL}/rest/v1/ratings?id=eq.${encodeURIComponent(id)}&user_id=eq.${encodeURIComponent(target_user_id)}`, {
+      method: 'DELETE',
+      headers: { 'apikey': SUPABASE_KEY, 'Authorization': `Bearer ${SUPABASE_KEY}`, 'Prefer': 'return=representation' }
+    });
+    if (!delRes.ok) return res.status(500).json({ error: 'Supabase error' });
+    res.json({ ok: true });
+  } catch(err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+app.get('/', (req, res) => res.send('Album Rater Bot — OK'));
+
+// ── AUTH ──
+const bcrypt = require('bcrypt');
+const crypto = require('crypto');
+const ADMIN_USER = 'kyujin';
+const sessions = {};
+
+function generateToken(username) {
+  const token = crypto.randomBytes(32).toString('hex');
+  sessions[token] = { username, expires: Date.now() + 1000 * 60 * 60 * 24 * 7 };
+  return token;
+}
+function verifyToken(token) {
+  const session = sessions[token];
+  if (!session) return null;
+  if (Date.now() > session.expires) { delete sessions[token]; return null; }
+  return session.username;
+}
+async function getUser(username) {
+  const res = await fetch(`${SUPABASE_URL}/rest/v1/users?username=eq.${encodeURIComponent(username)}&limit=1`, {
+    headers: { 'apikey': SUPABASE_KEY, 'Authorization': `Bearer ${SUPABASE_KEY}` }
+  });
+  const data = await res.json();
+  return data[0] || null;
+}
+async function createUser(username, passwordHash) {
+  const res = await fetch(`${SUPABASE_URL}/rest/v1/users`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json', 'apikey': SUPABASE_KEY, 'Authorization': `Bearer ${SUPABASE_KEY}`, 'Prefer': 'return=representation' },
+    body: JSON.stringify({ username, password_hash: passwordHash })
+  });
+  const data = await res.json();
+  if (!res.ok) throw new Error(JSON.stringify(data));
+  return data[0];
+}
+
+app.post('/register', express.json(), async (req, res) => {
+  try {
+    const { username, password } = req.body;
+    if (!username || !password) return res.status(400).json({ error: 'Faltan datos' });
+    if (username.length < 3) return res.status(400).json({ error: 'Username muy corto (mín 3 caracteres)' });
+    if (password.length < 6) return res.status(400).json({ error: 'Contraseña muy corta (mín 6 caracteres)' });
+    const existing = await getUser(username);
+    if (existing) return res.status(409).json({ error: 'Ese username ya está en uso' });
+    const hash = await bcrypt.hash(password, 10);
+    await createUser(username, hash);
+    const token = generateToken(username);
+    res.json({ ok: true, token, username });
+  } catch(err) {
+    console.error('[register]', err.message);
+    res.status(500).json({ error: err.message });
+  }
+});
+
+app.post('/login', express.json(), async (req, res) => {
+  try {
+    const { username, password } = req.body;
+    if (!username || !password) return res.status(400).json({ error: 'Faltan datos' });
+    const user = await getUser(username);
+    if (!user) return res.status(401).json({ error: 'Usuario o contraseña incorrectos' });
+    const match = await bcrypt.compare(password, user.password_hash);
+    if (!match) return res.status(401).json({ error: 'Usuario o contraseña incorrectos' });
+    const token = generateToken(username);
+    res.json({ ok: true, token, username });
+  } catch(err) {
+    console.error('[login]', err.message);
+    res.status(500).json({ error: err.message });
+  }
+});
+
+app.post('/verify', express.json(), async (req, res) => {
+  const { token } = req.body;
+  const username = verifyToken(token);
+  if (!username) return res.status(401).json({ error: 'Sesión inválida o expirada' });
+  res.json({ ok: true, username });
+});
+
+const PORT = process.env.PORT || 3000;
+app.listen(PORT, () => console.log(`Server running on port ${PORT}`));
+
+      
