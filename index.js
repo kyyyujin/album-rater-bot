@@ -13,6 +13,14 @@ const CLIENT_ID    = process.env.CLIENT_ID;
 const SUPABASE_URL = process.env.SUPABASE_URL;
 const SUPABASE_KEY = process.env.SUPABASE_KEY;
 
+// ── Discord OAuth (login web, distinto del bot de gateway) ──
+// CLIENT_ID se reutiliza (es la misma app de Discord que ya tenés).
+const DISCORD_CLIENT_SECRET = process.env.DISCORD_CLIENT_SECRET; // Nuevo: sacalo de Discord Developer Portal → OAuth2
+const DISCORD_REDIRECT_URI  = process.env.DISCORD_REDIRECT_URI;  // Nuevo: ej. https://album-rater-bot.onrender.com/auth/discord/callback
+                                                                   // Debe estar registrada tal cual en Discord Developer Portal → OAuth2 → Redirects
+const oauthStates = {}; // state (random) -> { returnTo, expires }  — anti-CSRF + para saber a qué página volver (Rater o Vault)
+const pendingDiscordProfiles = {}; // pendingToken -> { discordId, discordUsername, discordAvatar, expires } — cuenta de Discord sin match automático, esperando que el usuario confirme si tiene cuenta vieja
+
 // ── Register slash commands ──
 const commands = [
   new SlashCommandBuilder()
@@ -585,6 +593,42 @@ async function createUser(username, passwordHash) {
   return data[0];
 }
 
+// ── Discord OAuth: helpers ──
+// Requiere en Supabase 3 columnas nuevas en la tabla "users" (nullable):
+//   discord_id       text  (idealmente con índice/constraint unique)
+//   discord_username text
+//   discord_avatar   text
+async function getUserByDiscordId(discordId) {
+  const res = await fetch(`${SUPABASE_URL}/rest/v1/users?discord_id=eq.${encodeURIComponent(discordId)}&limit=1`, {
+    headers: { 'apikey': SUPABASE_KEY, 'Authorization': `Bearer ${SUPABASE_KEY}` }
+  });
+  const data = await res.json();
+  return data[0] || null;
+}
+
+async function linkDiscordToUser(userRowId, discordId, discordUsername, discordAvatar) {
+  const res = await fetch(`${SUPABASE_URL}/rest/v1/users?id=eq.${encodeURIComponent(userRowId)}`, {
+    method: 'PATCH',
+    headers: { 'Content-Type': 'application/json', 'apikey': SUPABASE_KEY, 'Authorization': `Bearer ${SUPABASE_KEY}`, 'Prefer': 'return=representation' },
+    body: JSON.stringify({ discord_id: discordId, discord_username: discordUsername, discord_avatar: discordAvatar })
+  });
+  const data = await res.json();
+  if (!res.ok) throw new Error(JSON.stringify(data));
+  return data[0];
+}
+
+async function createUserFromDiscord(username, discordId, discordUsername, discordAvatar) {
+  const res = await fetch(`${SUPABASE_URL}/rest/v1/users`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json', 'apikey': SUPABASE_KEY, 'Authorization': `Bearer ${SUPABASE_KEY}`, 'Prefer': 'return=representation' },
+    body: JSON.stringify({ username, discord_id: discordId, discord_username: discordUsername, discord_avatar: discordAvatar })
+    // password_hash queda null — esta cuenta nace directamente vinculada a Discord
+  });
+  const data = await res.json();
+  if (!res.ok) throw new Error(JSON.stringify(data));
+  return data[0];
+}
+
 app.post('/register', express.json(), async (req, res) => {
   try {
     const { username, password } = req.body;
@@ -624,6 +668,154 @@ app.post('/verify', express.json(), async (req, res) => {
   const username = verifyToken(token);
   if (!username) return res.status(401).json({ error: 'Sesión inválida o expirada' });
   res.json({ ok: true, username });
+});
+
+// ── Discord OAuth: login ──
+// 1) El frontend pide esta URL y redirige al usuario a Discord.
+app.get('/auth/discord/start', (req, res) => {
+  const returnTo = req.query.return_to;
+  if (!returnTo) return res.status(400).json({ error: 'Falta return_to' });
+
+  const state = crypto.randomBytes(16).toString('hex');
+  oauthStates[state] = { returnTo, expires: Date.now() + 1000 * 60 * 10 }; // 10 min
+
+  const params = new URLSearchParams({
+    client_id: CLIENT_ID,
+    redirect_uri: DISCORD_REDIRECT_URI,
+    response_type: 'code',
+    scope: 'identify',
+    state
+  });
+  res.json({ url: `https://discord.com/api/oauth2/authorize?${params.toString()}` });
+});
+
+// 2) Discord redirige acá después de que el usuario autoriza.
+//    Intercambiamos el code, buscamos/creamos/vinculamos el usuario, y volvemos al frontend con la sesión.
+app.get('/auth/discord/callback', async (req, res) => {
+  const { code, state, error: discordError } = req.query;
+
+  const stateEntry = state && oauthStates[state];
+  if (stateEntry) delete oauthStates[state]; // one-time use
+  const returnTo = (stateEntry && stateEntry.returnTo) || null;
+
+  function redirectWithError(message) {
+    if (!returnTo) return res.status(400).send(message);
+    const url = new URL(returnTo);
+    url.searchParams.set('auth_error', encodeURIComponent(message));
+    res.redirect(url.toString());
+  }
+
+  if (discordError) return redirectWithError('Autorización de Discord cancelada');
+  if (!code) return redirectWithError('Falta el código de Discord');
+  if (!stateEntry || Date.now() > stateEntry.expires) return redirectWithError('Sesión de login expirada, intentá de nuevo');
+
+  try {
+    // Canjear code por access_token
+    const tokenRes = await fetch('https://discord.com/api/oauth2/token', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+      body: new URLSearchParams({
+        client_id: CLIENT_ID,
+        client_secret: DISCORD_CLIENT_SECRET,
+        grant_type: 'authorization_code',
+        code,
+        redirect_uri: DISCORD_REDIRECT_URI
+      })
+    });
+    const tokenData = await tokenRes.json();
+    if (!tokenRes.ok) {
+      console.error('[discord oauth] token exchange failed:', tokenData);
+      return redirectWithError('No se pudo validar con Discord');
+    }
+
+    // Obtener perfil del usuario
+    const profileRes = await fetch('https://discord.com/api/users/@me', {
+      headers: { Authorization: `Bearer ${tokenData.access_token}` }
+    });
+    const profile = await profileRes.json();
+    if (!profileRes.ok) return redirectWithError('No se pudo obtener el perfil de Discord');
+
+    const discordId       = profile.id;
+    const discordUsername = profile.username;
+    const discordAvatar   = profile.avatar
+      ? `https://cdn.discordapp.com/avatars/${profile.id}/${profile.avatar}.png?size=256`
+      : `https://cdn.discordapp.com/embed/avatars/${(BigInt(profile.id) >> 22n) % 6n}.png`; // avatar default de Discord si no tiene uno
+
+    // 1) ¿Ya existe una cuenta vinculada a este discord_id?
+    let user = await getUserByDiscordId(discordId);
+
+    // 2) Si no existe, buscar una cuenta VIEJA con username == discordUsername y vincularla (migración automática).
+    if (!user) {
+      const legacyUser = await getUser(discordUsername);
+      if (legacyUser && !legacyUser.discord_id) {
+        user = await linkDiscordToUser(legacyUser.id, discordId, discordUsername, discordAvatar);
+      }
+    }
+
+    // 3) Si el nombre de Discord no coincide con ninguna cuenta vieja, no creamos nada todavía:
+    //    guardamos el perfil de Discord temporalmente y le devolvemos el control al frontend
+    //    para que le pregunte al usuario si tiene una cuenta anterior con otro nombre.
+    if (!user) {
+      const pendingToken = crypto.randomBytes(16).toString('hex');
+      pendingDiscordProfiles[pendingToken] = { discordId, discordUsername, discordAvatar, expires: Date.now() + 1000 * 60 * 10 };
+
+      const url = new URL(returnTo);
+      url.searchParams.set('discord_pending', pendingToken);
+      url.searchParams.set('discord_username', discordUsername);
+      url.searchParams.set('discord_avatar', discordAvatar);
+      return res.redirect(url.toString());
+    }
+
+    // 4) Mantener discord_username/avatar frescos si cambiaron en Discord desde la última vez.
+    if (user.discord_username !== discordUsername || user.discord_avatar !== discordAvatar) {
+      user = await linkDiscordToUser(user.id, discordId, discordUsername, discordAvatar);
+    }
+
+    const appToken = generateToken(user.username);
+
+    const url = new URL(returnTo);
+    url.searchParams.set('auth_token', appToken);
+    url.searchParams.set('discord_user_id', user.username); // se mantiene como identificador interno (user_id de ratings, etc.)
+    url.searchParams.set('discord_username', discordUsername);
+    url.searchParams.set('discord_avatar', discordAvatar);
+    res.redirect(url.toString());
+  } catch (err) {
+    console.error('[discord oauth] error:', err.message);
+    redirectWithError('Error interno al conectar con Discord');
+  }
+});
+
+// 3) El frontend, cuando no hubo auto-match, muestra un formulario y llama acá con:
+//      - pending_token (el discord_pending que recibió)
+//      - legacy_username (si el usuario dice "sí, tengo cuenta vieja, se llama X") — opcional
+//    Si no manda legacy_username, se crea una cuenta nueva vinculada directo a Discord.
+app.post('/auth/discord/finish', express.json(), async (req, res) => {
+  try {
+    const { pending_token, legacy_username } = req.body;
+    const pending = pending_token && pendingDiscordProfiles[pending_token];
+    if (!pending || Date.now() > pending.expires) {
+      return res.status(400).json({ error: 'Esa sesión de Discord expiró, volvé a intentar el login' });
+    }
+    delete pendingDiscordProfiles[pending_token]; // one-time use
+
+    const { discordId, discordUsername, discordAvatar } = pending;
+    let user;
+
+    if (legacy_username && legacy_username.trim()) {
+      const legacyUser = await getUser(legacy_username.trim());
+      if (!legacyUser) return res.status(404).json({ error: 'No existe ninguna cuenta con ese nombre' });
+      if (legacyUser.discord_id) return res.status(409).json({ error: 'Esa cuenta ya está vinculada a otro Discord' });
+      user = await linkDiscordToUser(legacyUser.id, discordId, discordUsername, discordAvatar);
+    } else {
+      user = await createUserFromDiscord(discordUsername, discordId, discordUsername, discordAvatar);
+    }
+
+    const appToken = generateToken(user.username);
+    res.json({ ok: true, token: appToken, username: user.username, discord_username: discordUsername, discord_avatar: discordAvatar });
+  } catch (err) {
+    console.error('[discord oauth finish] error:', err.message);
+    res.status(500).json({ error: err.message });
+  }
 });
 
 const PORT = process.env.PORT || 3000;
