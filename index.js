@@ -562,19 +562,46 @@ app.get('/', (req, res) => res.send('Album Rater Bot — OK'));
 const bcrypt = require('bcrypt');
 const crypto = require('crypto');
 const ADMIN_USER = 'kyujin';
-const sessions = {};
 
-function generateToken(username) {
+// Las sesiones ahora se persisten en Supabase (tabla "sessions") en vez de
+// vivir solo en memoria — así sobreviven a un redeploy/reinicio de Render.
+// Requiere en Supabase una tabla nueva:
+//   sessions ( token text primary key, username text, created_at timestamptz default now() )
+// Sin columna de expiración: la sesión dura indefinidamente hasta logout manual
+// (se borra la fila cuando el usuario cierra sesión — ver DELETE /auth/session).
+const sessionCache = {}; // token -> username — cache en memoria solo para no pegarle a Supabase en cada request; se repuebla sola si el proceso reinicia
+
+async function generateToken(username) {
   const token = crypto.randomBytes(32).toString('hex');
-  sessions[token] = { username, expires: Date.now() + 1000 * 60 * 60 * 24 * 7 };
+  const res = await fetch(`${SUPABASE_URL}/rest/v1/sessions`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json', 'apikey': SUPABASE_KEY, 'Authorization': `Bearer ${SUPABASE_KEY}`, 'Prefer': 'return=minimal' },
+    body: JSON.stringify({ token, username })
+  });
+  if (!res.ok) { const err = await res.text(); throw new Error(`No se pudo crear la sesión: ${err}`); }
+  sessionCache[token] = username;
   return token;
 }
-function verifyToken(token) {
-  const session = sessions[token];
-  if (!session) return null;
-  if (Date.now() > session.expires) { delete sessions[token]; return null; }
-  return session.username;
+
+async function verifyToken(token) {
+  if (sessionCache[token]) return sessionCache[token];
+  const res = await fetch(`${SUPABASE_URL}/rest/v1/sessions?token=eq.${encodeURIComponent(token)}&limit=1`, {
+    headers: { 'apikey': SUPABASE_KEY, 'Authorization': `Bearer ${SUPABASE_KEY}` }
+  });
+  const data = await res.json();
+  if (!data[0]) return null;
+  sessionCache[token] = data[0].username;
+  return data[0].username;
 }
+
+async function deleteToken(token) {
+  delete sessionCache[token];
+  await fetch(`${SUPABASE_URL}/rest/v1/sessions?token=eq.${encodeURIComponent(token)}`, {
+    method: 'DELETE',
+    headers: { 'apikey': SUPABASE_KEY, 'Authorization': `Bearer ${SUPABASE_KEY}` }
+  }).catch(err => console.error('[deleteToken]', err.message));
+}
+
 async function getUser(username) {
   const res = await fetch(`${SUPABASE_URL}/rest/v1/users?username=eq.${encodeURIComponent(username)}&limit=1`, {
     headers: { 'apikey': SUPABASE_KEY, 'Authorization': `Bearer ${SUPABASE_KEY}` }
@@ -629,6 +656,26 @@ async function createUserFromDiscord(username, discordId, discordUsername, disco
   return data[0];
 }
 
+// ── Álbum en progreso (work in progress) ──
+// Un solo slot por usuario, guardado como jsonb en users.work_in_progress.
+// Requiere en Supabase la columna (nullable): users.work_in_progress jsonb
+async function saveWorkInProgress(username, wip) {
+  const res = await fetch(`${SUPABASE_URL}/rest/v1/users?username=eq.${encodeURIComponent(username)}`, {
+    method: 'PATCH',
+    headers: { 'Content-Type': 'application/json', 'apikey': SUPABASE_KEY, 'Authorization': `Bearer ${SUPABASE_KEY}`, 'Prefer': 'return=minimal' },
+    body: JSON.stringify({ work_in_progress: wip })
+  });
+  if (!res.ok) { const err = await res.text(); throw new Error(err); }
+}
+
+async function getWorkInProgress(username) {
+  const res = await fetch(`${SUPABASE_URL}/rest/v1/users?username=eq.${encodeURIComponent(username)}&select=work_in_progress&limit=1`, {
+    headers: { 'apikey': SUPABASE_KEY, 'Authorization': `Bearer ${SUPABASE_KEY}` }
+  });
+  const data = await res.json();
+  return data[0]?.work_in_progress || null;
+}
+
 app.post('/register', express.json(), async (req, res) => {
   try {
     const { username, password } = req.body;
@@ -639,7 +686,7 @@ app.post('/register', express.json(), async (req, res) => {
     if (existing) return res.status(409).json({ error: 'Ese username ya está en uso' });
     const hash = await bcrypt.hash(password, 10);
     await createUser(username, hash);
-    const token = generateToken(username);
+    const token = await generateToken(username);
     res.json({ ok: true, token, username });
   } catch(err) {
     console.error('[register]', err.message);
@@ -655,7 +702,7 @@ app.post('/login', express.json(), async (req, res) => {
     if (!user) return res.status(401).json({ error: 'Usuario o contraseña incorrectos' });
     const match = await bcrypt.compare(password, user.password_hash);
     if (!match) return res.status(401).json({ error: 'Usuario o contraseña incorrectos' });
-    const token = generateToken(username);
+    const token = await generateToken(username);
     res.json({ ok: true, token, username });
   } catch(err) {
     console.error('[login]', err.message);
@@ -664,10 +711,50 @@ app.post('/login', express.json(), async (req, res) => {
 });
 
 app.post('/verify', express.json(), async (req, res) => {
+  try {
+    const { token } = req.body;
+    const username = await verifyToken(token);
+    if (!username) return res.status(401).json({ error: 'Sesión inválida o expirada' });
+    res.json({ ok: true, username });
+  } catch (err) {
+    console.error('[verify]', err.message);
+    res.status(500).json({ error: 'Error al verificar sesión' });
+  }
+});
+
+// Cierre de sesión explícito: borra el token de Supabase (además del logout del frontend, que solo limpia localStorage).
+app.post('/auth/logout', express.json(), async (req, res) => {
   const { token } = req.body;
-  const username = verifyToken(token);
-  if (!username) return res.status(401).json({ error: 'Sesión inválida o expirada' });
-  res.json({ ok: true, username });
+  if (token) await deleteToken(token);
+  res.json({ ok: true });
+});
+
+// ── Álbum en progreso: guardar / recuperar ──
+// Ambos requieren el token de sesión, igual que /verify.
+app.post('/work-in-progress', express.json(), async (req, res) => {
+  try {
+    const { token, wip } = req.body;
+    const username = await verifyToken(token);
+    if (!username) return res.status(401).json({ error: 'Sesión inválida o expirada' });
+    await saveWorkInProgress(username, wip ?? null);
+    res.json({ ok: true });
+  } catch (err) {
+    console.error('[work-in-progress save]', err.message);
+    res.status(500).json({ error: 'No se pudo guardar el progreso' });
+  }
+});
+
+app.post('/work-in-progress/get', express.json(), async (req, res) => {
+  try {
+    const { token } = req.body;
+    const username = await verifyToken(token);
+    if (!username) return res.status(401).json({ error: 'Sesión inválida o expirada' });
+    const wip = await getWorkInProgress(username);
+    res.json({ ok: true, wip });
+  } catch (err) {
+    console.error('[work-in-progress get]', err.message);
+    res.status(500).json({ error: 'No se pudo recuperar el progreso' });
+  }
 });
 
 // ── Discord OAuth: login ──
@@ -771,11 +858,7 @@ app.get('/auth/discord/callback', async (req, res) => {
       user = await linkDiscordToUser(user.id, discordId, discordUsername, discordAvatar);
     }
 
-    const appToken = generateToken(user.username);
-
-    const url = new URL(returnTo);
-    url.searchParams.set('auth_token', appToken);
-    url.searchParams.set('discord_user_id', user.username); // se mantiene como identificador interno (user_id de ratings, etc.)
+    const appToken = await generateToken(user.username);
     url.searchParams.set('discord_username', discordUsername);
     url.searchParams.set('discord_avatar', discordAvatar);
     res.redirect(url.toString());
@@ -810,7 +893,7 @@ app.post('/auth/discord/finish', express.json(), async (req, res) => {
       user = await createUserFromDiscord(discordUsername, discordId, discordUsername, discordAvatar);
     }
 
-    const appToken = generateToken(user.username);
+    const appToken = await generateToken(user.username);
     res.json({ ok: true, token: appToken, username: user.username, discord_username: discordUsername, discord_avatar: discordAvatar });
   } catch (err) {
     console.error('[discord oauth finish] error:', err.message);
