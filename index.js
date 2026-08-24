@@ -676,6 +676,26 @@ async function getWorkInProgress(username) {
   return data[0]?.work_in_progress || null;
 }
 
+// ── Colección de Album Vault ──
+// Igual que work_in_progress, pero para la colección completa de álbumes en tiers.
+// Requiere en Supabase la columna (nullable): users.vault_collection jsonb
+async function saveVaultCollection(username, collection) {
+  const res = await fetch(`${SUPABASE_URL}/rest/v1/users?username=eq.${encodeURIComponent(username)}`, {
+    method: 'PATCH',
+    headers: { 'Content-Type': 'application/json', 'apikey': SUPABASE_KEY, 'Authorization': `Bearer ${SUPABASE_KEY}`, 'Prefer': 'return=minimal' },
+    body: JSON.stringify({ vault_collection: collection })
+  });
+  if (!res.ok) { const err = await res.text(); throw new Error(err); }
+}
+
+async function getVaultCollection(username) {
+  const res = await fetch(`${SUPABASE_URL}/rest/v1/users?username=eq.${encodeURIComponent(username)}&select=vault_collection&limit=1`, {
+    headers: { 'apikey': SUPABASE_KEY, 'Authorization': `Bearer ${SUPABASE_KEY}` }
+  });
+  const data = await res.json();
+  return data[0]?.vault_collection || null;
+}
+
 app.post('/register', express.json(), async (req, res) => {
   try {
     const { username, password } = req.body;
@@ -754,6 +774,34 @@ app.post('/work-in-progress/get', express.json(), async (req, res) => {
   } catch (err) {
     console.error('[work-in-progress get]', err.message);
     res.status(500).json({ error: 'No se pudo recuperar el progreso' });
+  }
+});
+
+// ── Colección de Album Vault: guardar / recuperar ──
+// Mismo patrón que /work-in-progress, para la app de Vault (login compartido con Rater).
+app.post('/vault-collection', express.json(), async (req, res) => {
+  try {
+    const { token, collection } = req.body;
+    const username = await verifyToken(token);
+    if (!username) return res.status(401).json({ error: 'Sesión inválida o expirada' });
+    await saveVaultCollection(username, collection ?? null);
+    res.json({ ok: true });
+  } catch (err) {
+    console.error('[vault-collection save]', err.message);
+    res.status(500).json({ error: 'No se pudo guardar la colección' });
+  }
+});
+
+app.post('/vault-collection/get', express.json(), async (req, res) => {
+  try {
+    const { token } = req.body;
+    const username = await verifyToken(token);
+    if (!username) return res.status(401).json({ error: 'Sesión inválida o expirada' });
+    const collection = await getVaultCollection(username);
+    res.json({ ok: true, collection });
+  } catch (err) {
+    console.error('[vault-collection get]', err.message);
+    res.status(500).json({ error: 'No se pudo recuperar la colección' });
   }
 });
 
