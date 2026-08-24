@@ -859,6 +859,10 @@ app.get('/auth/discord/callback', async (req, res) => {
     }
 
     const appToken = await generateToken(user.username);
+
+    const url = new URL(returnTo);
+    url.searchParams.set('auth_token', appToken);
+    url.searchParams.set('discord_user_id', user.username); // se mantiene como identificador interno (user_id de ratings, etc.)
     url.searchParams.set('discord_username', discordUsername);
     url.searchParams.set('discord_avatar', discordAvatar);
     res.redirect(url.toString());
