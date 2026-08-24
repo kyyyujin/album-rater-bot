@@ -696,6 +696,25 @@ async function getVaultCollection(username) {
   return data[0]?.vault_collection || null;
 }
 
+// ── Perfil de Vault (banner, bio, favoritos elegidos a mano) ──
+// Requiere en Supabase la columna (nullable): users.vault_profile jsonb
+async function saveVaultProfile(username, profile) {
+  const res = await fetch(`${SUPABASE_URL}/rest/v1/users?username=eq.${encodeURIComponent(username)}`, {
+    method: 'PATCH',
+    headers: { 'Content-Type': 'application/json', 'apikey': SUPABASE_KEY, 'Authorization': `Bearer ${SUPABASE_KEY}`, 'Prefer': 'return=minimal' },
+    body: JSON.stringify({ vault_profile: profile })
+  });
+  if (!res.ok) { const err = await res.text(); throw new Error(err); }
+}
+
+async function getVaultProfile(username) {
+  const res = await fetch(`${SUPABASE_URL}/rest/v1/users?username=eq.${encodeURIComponent(username)}&select=vault_profile&limit=1`, {
+    headers: { 'apikey': SUPABASE_KEY, 'Authorization': `Bearer ${SUPABASE_KEY}` }
+  });
+  const data = await res.json();
+  return data[0]?.vault_profile || null;
+}
+
 app.post('/register', express.json(), async (req, res) => {
   try {
     const { username, password } = req.body;
@@ -802,6 +821,36 @@ app.post('/vault-collection/get', express.json(), async (req, res) => {
   } catch (err) {
     console.error('[vault-collection get]', err.message);
     res.status(500).json({ error: 'No se pudo recuperar la colección' });
+  }
+});
+
+// ── Perfil de Vault: guardar / recuperar ──
+// { banner: dataURL o null, bio: string, pinned: [albumId, ...] }
+// El banner viaja como imagen base64; se limita el tamaño del body para no permitir
+// imágenes gigantes que infen la fila (el frontend ya redimensiona antes de mandar).
+app.post('/vault-profile', express.json({ limit: '4mb' }), async (req, res) => {
+  try {
+    const { token, profile } = req.body;
+    const username = await verifyToken(token);
+    if (!username) return res.status(401).json({ error: 'Sesión inválida o expirada' });
+    await saveVaultProfile(username, profile ?? null);
+    res.json({ ok: true });
+  } catch (err) {
+    console.error('[vault-profile save]', err.message);
+    res.status(500).json({ error: 'No se pudo guardar el perfil' });
+  }
+});
+
+app.post('/vault-profile/get', express.json(), async (req, res) => {
+  try {
+    const { token } = req.body;
+    const username = await verifyToken(token);
+    if (!username) return res.status(401).json({ error: 'Sesión inválida o expirada' });
+    const profile = await getVaultProfile(username);
+    res.json({ ok: true, profile });
+  } catch (err) {
+    console.error('[vault-profile get]', err.message);
+    res.status(500).json({ error: 'No se pudo recuperar el perfil' });
   }
 });
 
