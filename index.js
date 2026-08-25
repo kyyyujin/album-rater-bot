@@ -854,6 +854,32 @@ app.post('/vault-profile/get', express.json(), async (req, res) => {
   }
 });
 
+// ── Perfil público de Vault (solo lectura, sin token) ──
+// Búsqueda por discord_username (lo que el usuario reconoce y comparte).
+// Devuelve solo lo necesario para renderizar el perfil ajeno: nunca password_hash,
+// discord_id, ni tokens de sesión.
+app.get('/public-profile/:discordUsername', async (req, res) => {
+  try {
+    const discordUsername = req.params.discordUsername;
+    if (!discordUsername) return res.status(400).json({ error: 'Falta username' });
+    const url = `${SUPABASE_URL}/rest/v1/users?discord_username=ilike.${encodeURIComponent(discordUsername)}&select=username,discord_username,discord_avatar,vault_profile,vault_collection&limit=1`;
+    const sbRes = await fetch(url, { headers: { 'apikey': SUPABASE_KEY, 'Authorization': `Bearer ${SUPABASE_KEY}` } });
+    const data = await sbRes.json();
+    const user = data[0];
+    if (!user) return res.status(404).json({ error: 'Usuario no encontrado' });
+    res.json({
+      ok: true,
+      discord_username: user.discord_username,
+      discord_avatar: user.discord_avatar,
+      profile: user.vault_profile || null,
+      collection: user.vault_collection || null
+    });
+  } catch (err) {
+    console.error('[public-profile]', err.message);
+    res.status(500).json({ error: 'No se pudo cargar el perfil' });
+  }
+});
+
 // ── Discord OAuth: login ──
 // 1) El frontend pide esta URL y redirige al usuario a Discord.
 app.get('/auth/discord/start', (req, res) => {
