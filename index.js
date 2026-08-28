@@ -890,7 +890,15 @@ app.get('/public-profile/:discordUsername', async (req, res) => {
       discord_username: user.discord_username,
       discord_avatar: user.discord_avatar,
       profile: user.vault_profile || null,
-      collection: user.vault_collection || null
+      collection: user.vault_collection || null,
+      // Debug temporal — quitar una vez resuelto el problema de perfiles ajenos en 0.
+      _debug: {
+        matches_found: matches.length,
+        matched_usernames: matches.map(u => u.username),
+        chosen_username: user.username,
+        has_vault_collection: !!user.vault_collection,
+        has_vault_profile: !!user.vault_profile
+      }
     });
   } catch (err) {
     console.error('[public-profile]', err.message);
