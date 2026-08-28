@@ -858,15 +858,33 @@ app.post('/vault-profile/get', express.json(), async (req, res) => {
 // Búsqueda por discord_username (lo que el usuario reconoce y comparte).
 // Devuelve solo lo necesario para renderizar el perfil ajeno: nunca password_hash,
 // discord_id, ni tokens de sesión.
+//
+// Nota: puede haber más de una fila en `users` con el mismo discord_username si un
+// usuario tuvo una cuenta vieja (username/password) y luego, al vincular Discord,
+// no hizo el match automático y terminó creando una cuenta nueva en vez de vincular
+// la vieja — quedan dos filas con el mismo discord_username pero distinto `username`
+// interno, y solo una de ellas tiene la sesión activa (donde sí se guarda
+// vault_collection). Por eso acá se piden todas las coincidencias y se elige la que
+// realmente tenga datos, en vez de confiar en cuál devuelve la DB primero.
 app.get('/public-profile/:discordUsername', async (req, res) => {
   try {
     const discordUsername = req.params.discordUsername;
     if (!discordUsername) return res.status(400).json({ error: 'Falta username' });
-    const url = `${SUPABASE_URL}/rest/v1/users?discord_username=ilike.${encodeURIComponent(discordUsername)}&select=username,discord_username,discord_avatar,vault_profile,vault_collection&limit=1`;
+    const url = `${SUPABASE_URL}/rest/v1/users?discord_username=ilike.${encodeURIComponent(discordUsername)}&select=username,discord_username,discord_avatar,vault_profile,vault_collection`;
     const sbRes = await fetch(url, { headers: { 'apikey': SUPABASE_KEY, 'Authorization': `Bearer ${SUPABASE_KEY}` } });
-    const data = await sbRes.json();
-    const user = data[0];
-    if (!user) return res.status(404).json({ error: 'Usuario no encontrado' });
+    const matches = await sbRes.json();
+    if (!Array.isArray(matches) || !matches.length) return res.status(404).json({ error: 'Usuario no encontrado' });
+
+    // Preferir la fila con vault_collection poblada; si ninguna la tiene, la que
+    // tenga vault_profile; si ninguna, la primera (comportamiento anterior).
+    const user = matches.find(u => u.vault_collection)
+      || matches.find(u => u.vault_profile)
+      || matches[0];
+
+    if (matches.length > 1) {
+      console.warn(`[public-profile] ${matches.length} filas duplicadas para discord_username=${discordUsername} — usando username=${user.username}`);
+    }
+
     res.json({
       ok: true,
       discord_username: user.discord_username,
