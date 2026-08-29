@@ -874,7 +874,7 @@ app.get('/public-profiles/search', async (req, res) => {
     const query = String(req.query.q || '').trim();
     if (!query) return res.json({ ok: true, users: [] });
     const pattern = `*${query.replace(/[*,()]/g, '')}*`;
-    const url = `${SUPABASE_URL}/rest/v1/users?discord_username=ilike.${encodeURIComponent(pattern)}&select=discord_username,discord_avatar&limit=12`;
+    const url = `${SUPABASE_URL}/rest/v1/users?or=(discord_username.ilike.${encodeURIComponent(pattern)},username.ilike.${encodeURIComponent(pattern)})&select=username,discord_username,discord_avatar&limit=12`;
     const sbRes = await fetch(url, {
       headers: { 'apikey': SUPABASE_KEY, 'Authorization': `Bearer ${SUPABASE_KEY}` }
     });
@@ -885,16 +885,16 @@ app.get('/public-profiles/search', async (req, res) => {
 
     const seen = new Set();
     const users = rows
-      .filter(row => row.discord_username)
+      .filter(row => row.discord_username || row.username)
       .filter(row => {
-        const key = row.discord_username.toLowerCase();
+        const key = (row.discord_username || row.username).toLowerCase();
         if (seen.has(key)) return false;
         seen.add(key);
         return true;
       })
       .slice(0, 8)
       .map(row => ({
-        discord_username: row.discord_username,
+        discord_username: row.discord_username || row.username,
         discord_avatar: row.discord_avatar || null
       }));
 
@@ -909,7 +909,8 @@ app.get('/public-profile/:discordUsername', async (req, res) => {
   try {
     const discordUsername = req.params.discordUsername;
     if (!discordUsername) return res.status(400).json({ error: 'Falta username' });
-    const url = `${SUPABASE_URL}/rest/v1/users?discord_username=ilike.${encodeURIComponent(discordUsername)}&select=username,discord_username,discord_avatar,vault_profile,vault_collection`;
+    const profilePattern = discordUsername.replace(/[*,()]/g, '');
+    const url = `${SUPABASE_URL}/rest/v1/users?or=(discord_username.ilike.${encodeURIComponent(profilePattern)},username.ilike.${encodeURIComponent(profilePattern)})&select=username,discord_username,discord_avatar,vault_profile,vault_collection`;
     const sbRes = await fetch(url, { headers: { 'apikey': SUPABASE_KEY, 'Authorization': `Bearer ${SUPABASE_KEY}` } });
     const matches = await sbRes.json();
     if (!Array.isArray(matches) || !matches.length) return res.status(404).json({ error: 'Usuario no encontrado' });
@@ -987,7 +988,7 @@ app.get('/public-profile/:discordUsername', async (req, res) => {
 
     res.json({
       ok: true,
-      discord_username: profileUser.discord_username,
+      discord_username: profileUser.discord_username || profileUser.username,
       discord_avatar: profileUser.discord_avatar,
       profile: profileUser.vault_profile || null,
       collection
