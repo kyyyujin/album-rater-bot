@@ -866,6 +866,45 @@ app.post('/vault-profile/get', express.json(), async (req, res) => {
 // interno, y solo una de ellas tiene la sesión activa (donde sí se guarda
 // vault_collection). Por eso acá se piden todas las coincidencias y se elige la que
 // realmente tenga datos, en vez de confiar en cuál devuelve la DB primero.
+// ── Búsqueda pública de perfiles (autocompletado del Vault) ──
+// Devuelve únicamente nombre y avatar. La coincidencia es parcial y no distingue
+// mayúsculas/minúsculas; nunca expone username interno, discord_id ni datos privados.
+app.get('/public-profiles/search', async (req, res) => {
+  try {
+    const query = String(req.query.q || '').trim();
+    if (!query) return res.json({ ok: true, users: [] });
+    const pattern = `*${query.replace(/[*,()]/g, '')}*`;
+    const url = `${SUPABASE_URL}/rest/v1/users?discord_username=ilike.${encodeURIComponent(pattern)}&select=discord_username,discord_avatar&limit=12`;
+    const sbRes = await fetch(url, {
+      headers: { 'apikey': SUPABASE_KEY, 'Authorization': `Bearer ${SUPABASE_KEY}` }
+    });
+    const rows = await sbRes.json();
+    if (!sbRes.ok || !Array.isArray(rows)) {
+      return res.status(500).json({ error: 'No se pudieron buscar usuarios' });
+    }
+
+    const seen = new Set();
+    const users = rows
+      .filter(row => row.discord_username)
+      .filter(row => {
+        const key = row.discord_username.toLowerCase();
+        if (seen.has(key)) return false;
+        seen.add(key);
+        return true;
+      })
+      .slice(0, 8)
+      .map(row => ({
+        discord_username: row.discord_username,
+        discord_avatar: row.discord_avatar || null
+      }));
+
+    res.json({ ok: true, users });
+  } catch (err) {
+    console.error('[public-profiles search]', err.message);
+    res.status(500).json({ error: 'No se pudieron buscar usuarios' });
+  }
+});
+
 app.get('/public-profile/:discordUsername', async (req, res) => {
   try {
     const discordUsername = req.params.discordUsername;
