@@ -875,22 +875,83 @@ app.get('/public-profile/:discordUsername', async (req, res) => {
     const matches = await sbRes.json();
     if (!Array.isArray(matches) || !matches.length) return res.status(404).json({ error: 'Usuario no encontrado' });
 
-    // Preferir la fila con vault_collection poblada; si ninguna la tiene, la que
-    // tenga vault_profile; si ninguna, la primera (comportamiento anterior).
-    const user = matches.find(u => u.vault_collection)
-      || matches.find(u => u.vault_profile)
-      || matches[0];
+    // Perfil y colección pueden haber quedado en filas distintas por migraciones
+    // antiguas de Discord. Resolver cada bloque por separado evita perder uno al
+    // elegir una sola fila como fuente de todos los datos.
+    const profileUser = matches.find(u => u.vault_profile) || matches[0];
+    const collectionUser = matches.find(u => u.vault_collection) || null;
+    let collection = collectionUser?.vault_collection || null;
+
+    // Usuarios que todavía no sincronizaron una colección del Vault sí pueden
+    // tener cientos de ratings históricos. En ese caso reconstruimos una colección
+    // pública compatible a partir de ratings, buscando user_id sin distinguir
+    // mayúsculas/minúsculas (Discord puede mostrar "Pinovic" mientras ratings usa
+    // "pinovic"). Esto es solo lectura y no modifica ninguna fila.
+    if (!collection) {
+      const identifiers = [...new Set(
+        [collectionUser?.username, profileUser?.username, profileUser?.discord_username, discordUsername]
+          .filter(Boolean)
+      )];
+
+      let ratingRows = [];
+      for (const identifier of identifiers) {
+        const ratingsUrl = `${SUPABASE_URL}/rest/v1/ratings?user_id=ilike.${encodeURIComponent(identifier)}&order=created_at.desc`;
+        const ratingsRes = await fetch(ratingsUrl, {
+          headers: { 'apikey': SUPABASE_KEY, 'Authorization': `Bearer ${SUPABASE_KEY}` }
+        });
+        const candidateRows = await ratingsRes.json();
+        if (Array.isArray(candidateRows) && candidateRows.length) {
+          ratingRows = candidateRows;
+          break;
+        }
+      }
+
+      if (ratingRows.length) {
+        collection = {
+          nowPlayingId: null,
+          albums: ratingRows.map(row => {
+            const score = Number.parseFloat(row.final_score) || 0;
+            const rawTracks = Array.isArray(row.tracks) ? row.tracks : [];
+            return {
+              id: `rating_${row.id}`,
+              _dbId: row.id,
+              title: row.album_title || row.title || '',
+              artist: row.artist || '',
+              year: row.year || '',
+              coverUrl: row.cover_url || '',
+              score,
+              finalRank: row.final_rank || '',
+              tracks: rawTracks.map(track => typeof track === 'string' ? track : track?.name).filter(Boolean),
+              trackScores: Object.fromEntries(
+                rawTracks
+                  .filter(track => track && typeof track === 'object' && track.name && track.score !== '' && track.score != null)
+                  .map(track => [track.name.trim(), Number.parseFloat(track.score)])
+              ),
+              notes: row.notes || '',
+              listenDate: row.created_at ? new Date(row.created_at).toISOString().slice(0, 10) : '',
+              addedAt: row.created_at ? new Date(row.created_at).getTime() : Date.now(),
+              status: 'listened',
+              genres: typeof row.genre === 'string'
+                ? row.genre.split(/[,/]/).map(genre => genre.trim()).filter(Boolean)
+                : (Array.isArray(row.genre) ? row.genre : []),
+              replays: []
+            };
+          })
+        };
+        console.log(`[public-profile] colección reconstruida desde ${ratingRows.length} ratings para ${discordUsername}`);
+      }
+    }
 
     if (matches.length > 1) {
-      console.warn(`[public-profile] ${matches.length} filas duplicadas para discord_username=${discordUsername} — usando username=${user.username}`);
+      console.warn(`[public-profile] ${matches.length} filas duplicadas para discord_username=${discordUsername}`);
     }
 
     res.json({
       ok: true,
-      discord_username: user.discord_username,
-      discord_avatar: user.discord_avatar,
-      profile: user.vault_profile || null,
-      collection: user.vault_collection || null
+      discord_username: profileUser.discord_username,
+      discord_avatar: profileUser.discord_avatar,
+      profile: profileUser.vault_profile || null,
+      collection
     });
   } catch (err) {
     console.error('[public-profile]', err.message);
