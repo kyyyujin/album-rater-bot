@@ -707,7 +707,7 @@ function normalizeCoverMatch(value) {
 
 function toHighResItunesArtwork(url) {
   return typeof url === 'string'
-    ? url.replace(/\\d+x\\d+bb/i, '1200x1200bb')
+    ? url.replace(/\d+x\d+bb/i, '1200x1200bb')
     : '';
 }
 
@@ -771,7 +771,7 @@ async function runVaultCoverQualityMigration() {
         if (!album?.coverUrl || !album?.title || !album?.artist) continue;
 
         // Una URL de Apple ya es válida: se normaliza a 1200 px sin otra consulta.
-        if (/mzstatic\\.com/i.test(album.coverUrl)) {
+        if (/mzstatic\.com/i.test(album.coverUrl)) {
           const highRes = toHighResItunesArtwork(album.coverUrl);
           if (highRes && highRes !== album.coverUrl) {
             album.coverUrl = highRes;
