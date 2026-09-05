@@ -696,6 +696,114 @@ async function getVaultCollection(username) {
   return data[0]?.vault_collection || null;
 }
 
+// ── Migración única de portadas de Vault ──
+// Corre en el servidor, no expone ninguna ruta pública ni modifica álbumes si
+// iTunes no devuelve exactamente el mismo título y artista.
+const COVER_QUALITY_MIGRATION_VERSION = 'v1';
+
+function normalizeCoverMatch(value) {
+  return String(value || '').toLowerCase().replace(/[^a-z0-9]/g, '');
+}
+
+function toHighResItunesArtwork(url) {
+  return typeof url === 'string'
+    ? url.replace(/\\d+x\\d+bb/i, '1200x1200bb')
+    : '';
+}
+
+async function findExactHighResItunesCover(title, artist) {
+  if (!title || !artist) return null;
+  try {
+    const query = encodeURIComponent(`${artist} ${title}`.trim());
+    const response = await fetch(`https://itunes.apple.com/search?term=${query}&media=music&entity=album&limit=8`);
+    if (!response.ok) return null;
+    const { results = [] } = await response.json();
+    const targetTitle = normalizeCoverMatch(title);
+    const targetArtist = normalizeCoverMatch(artist);
+    const match = results.find(item =>
+      normalizeCoverMatch(item.collectionName) === targetTitle &&
+      normalizeCoverMatch(item.artistName) === targetArtist
+    );
+    return match?.artworkUrl100 ? toHighResItunesArtwork(match.artworkUrl100) : null;
+  } catch {
+    return null;
+  }
+}
+
+async function getPendingVaultCoverMigrations() {
+  const response = await fetch(
+    `${SUPABASE_URL}/rest/v1/users?cover_quality_migrated_at=is.null&vault_collection=not.is.null&select=id,vault_collection`,
+    { headers: { 'apikey': SUPABASE_KEY, 'Authorization': `Bearer ${SUPABASE_KEY}` } }
+  );
+  if (!response.ok) throw new Error(await response.text());
+  return response.json();
+}
+
+async function completeVaultCoverMigration(userId, collection) {
+  const response = await fetch(`${SUPABASE_URL}/rest/v1/users?id=eq.${encodeURIComponent(userId)}`, {
+    method: 'PATCH',
+    headers: {
+      'Content-Type': 'application/json',
+      'apikey': SUPABASE_KEY,
+      'Authorization': `Bearer ${SUPABASE_KEY}`,
+      'Prefer': 'return=minimal'
+    },
+    body: JSON.stringify({
+      vault_collection: collection,
+      cover_quality_migrated_at: new Date().toISOString()
+    })
+  });
+  if (!response.ok) throw new Error(await response.text());
+}
+
+async function runVaultCoverQualityMigration() {
+  try {
+    const users = await getPendingVaultCoverMigrations();
+    let migratedUsers = 0;
+    let upgradedCovers = 0;
+
+    for (const user of users) {
+      const collection = user.vault_collection;
+      const albums = Array.isArray(collection?.albums) ? collection.albums : [];
+      let changed = false;
+
+      for (const album of albums) {
+        if (!album?.coverUrl || !album?.title || !album?.artist) continue;
+
+        // Una URL de Apple ya es válida: se normaliza a 1200 px sin otra consulta.
+        if (/mzstatic\\.com/i.test(album.coverUrl)) {
+          const highRes = toHighResItunesArtwork(album.coverUrl);
+          if (highRes && highRes !== album.coverUrl) {
+            album.coverUrl = highRes;
+            changed = true;
+            upgradedCovers++;
+          }
+          continue;
+        }
+
+        const highRes = await findExactHighResItunesCover(album.title, album.artist);
+        if (highRes && highRes !== album.coverUrl) {
+          album.coverUrl = highRes;
+          changed = true;
+          upgradedCovers++;
+        }
+
+        // No se hacen ráfagas contra iTunes aunque haya más perfiles en el futuro.
+        await new Promise(resolve => setTimeout(resolve, 160));
+      }
+
+      await completeVaultCoverMigration(user.id, collection);
+      migratedUsers++;
+    }
+
+    if (migratedUsers) {
+      console.log(`[vault-cover-quality ${COVER_QUALITY_MIGRATION_VERSION}] perfiles: ${migratedUsers}, portadas mejoradas: ${upgradedCovers}`);
+    }
+  } catch (error) {
+    console.error('[vault-cover-quality] migración pendiente; se reintentará en el próximo inicio:', error.message);
+  }
+}
+
 // ── Perfil de Vault (banner, bio, favoritos elegidos a mano) ──
 // Requiere en Supabase la columna (nullable): users.vault_profile jsonb
 async function saveVaultProfile(username, profile) {
@@ -1148,6 +1256,10 @@ app.post('/auth/discord/finish', express.json(), async (req, res) => {
 });
 
 const PORT = process.env.PORT || 3000;
-app.listen(PORT, () => console.log(`Server running on port ${PORT}`));
+app.listen(PORT, () => {
+  console.log(`Server running on port ${PORT}`);
+  // Corre después de que Render marque el proceso como disponible.
+  setTimeout(() => { runVaultCoverQualityMigration(); }, 3000);
+});
 
       
