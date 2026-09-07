@@ -280,7 +280,7 @@ async function changeBotPfp(coverUrl) {
 
 app.post('/post', upload.single('file'), async (req, res) => {
   try {
-    const { title, thread_id, user_id, artist, cover_url, tracks, final_score, final_rank, notes } = req.body;
+    const { title, thread_id, user_id, artist, cover_url, cover_score, tracks, final_score, final_rank, notes } = req.body;
     if (!req.file)  return res.status(400).json({ error: 'No image provided' });
     if (!title)     return res.status(400).json({ error: 'No title provided' });
     if (!thread_id) return res.status(400).json({ error: 'No thread_id provided' });
@@ -305,6 +305,7 @@ app.post('/post', upload.single('file'), async (req, res) => {
           album_title: cleanTitle,
           artist:      artist      || null,
           cover_url:   cover_url   || null,
+          cover_score: cover_score !== undefined && cover_score !== '' ? parseFloat(cover_score) : null,
           year:        req.body.year  || null,
           genre:       req.body.genre || null,
           tracks:      tracks ? JSON.parse(tracks) : null,
@@ -352,7 +353,7 @@ app.post('/delete', express.json(), async (req, res) => {
 
 app.post('/save', upload.single('file'), async (req, res) => {
   try {
-    const { title, user_id, artist, cover_url, tracks, final_score, final_rank, notes } = req.body;
+    const { title, user_id, artist, cover_url, cover_score, tracks, final_score, final_rank, notes } = req.body;
     if (!req.file)  return res.status(400).json({ error: 'No image provided' });
     if (!title)     return res.status(400).json({ error: 'No title provided' });
     if (!user_id)   return res.status(400).json({ error: 'No user_id provided' });
@@ -363,6 +364,7 @@ app.post('/save', upload.single('file'), async (req, res) => {
       album_title: cleanTitle,
       artist:      artist      || null,
       cover_url:   cover_url   || null,
+      cover_score: cover_score !== undefined && cover_score !== '' ? parseFloat(cover_score) : null,
       year:        req.body.year  || null,
       genre:       req.body.genre || null,
       tracks:      tracks ? JSON.parse(tracks) : null,
@@ -497,9 +499,10 @@ app.post('/clean-duplicates', express.json(), async (req, res) => {
 // ── Update rating directly (no image needed) ──
 app.post('/update-rating', express.json(), async (req, res) => {
   try {
-    const { user_id, album_title, artist, year, genre, cover_url, final_score, final_rank, tracks } = req.body;
+    const { user_id, album_title, artist, year, genre, cover_url, cover_score, final_score, final_rank, tracks } = req.body;
     if (!user_id || !album_title) return res.status(400).json({ error: 'Faltan datos' });
     const data = { user_id, album_title, artist, year, genre, cover_url, final_score, final_rank, tracks };
+    if (cover_score !== undefined && cover_score !== '') data.cover_score = parseFloat(cover_score);
     const result = await saveRating(data);
     res.json({ ok: true, result });
   } catch(err) {
