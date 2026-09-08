@@ -18,6 +18,8 @@ const SUPABASE_KEY = process.env.SUPABASE_KEY;
 const DISCORD_CLIENT_SECRET = process.env.DISCORD_CLIENT_SECRET; // Nuevo: sacalo de Discord Developer Portal → OAuth2
 const DISCORD_REDIRECT_URI  = process.env.DISCORD_REDIRECT_URI;  // Nuevo: ej. https://album-rater-bot.onrender.com/auth/discord/callback
                                                                    // Debe estar registrada tal cual en Discord Developer Portal → OAuth2 → Redirects
+// El Rater está temporalmente reservado para la cuenta propietaria. Vault sigue usando el login compartido sin esta restricción.
+const RATER_OWNER_DISCORD_ID = '730588850547851275';
 const oauthStates = {}; // state (random) -> { returnTo, expires }  — anti-CSRF + para saber a qué página volver (Rater o Vault)
 const pendingDiscordProfiles = {}; // pendingToken -> { discordId, discordUsername, discordAvatar, expires } — cuenta de Discord sin match automático, esperando que el usuario confirme si tiene cuenta vieja
 
@@ -872,6 +874,27 @@ app.post('/verify', express.json(), async (req, res) => {
   }
 });
 
+// Solo el Rater usa esta comprobación: la identidad sale de la sesión validada en servidor,
+// no de localStorage ni del nombre que envíe el navegador.
+app.post('/rater-access', express.json(), async (req, res) => {
+  try {
+    const { token } = req.body;
+    const username = await verifyToken(token);
+    if (!username) return res.status(401).json({ error: 'Sesión inválida o expirada' });
+
+    const user = await getUser(username);
+    if (!user || user.discord_id !== RATER_OWNER_DISCORD_ID) {
+      if (token) await deleteToken(token);
+      return res.status(403).json({ error: 'El Rater está reservado temporalmente para su propietario.' });
+    }
+
+    res.json({ ok: true, username });
+  } catch (err) {
+    console.error('[rater-access]', err.message);
+    res.status(500).json({ error: 'No se pudo verificar el acceso al Rater' });
+  }
+});
+
 // Cierre de sesión explícito: borra el token de Supabase (además del logout del frontend, que solo limpia localStorage).
 app.post('/auth/logout', express.json(), async (req, res) => {
   const { token } = req.body;
@@ -1117,7 +1140,8 @@ app.get('/auth/discord/start', (req, res) => {
   if (!returnTo) return res.status(400).json({ error: 'Falta return_to' });
 
   const state = crypto.randomBytes(16).toString('hex');
-  oauthStates[state] = { returnTo, expires: Date.now() + 1000 * 60 * 10 }; // 10 min
+  const raterOnly = req.query.rater_only === '1';
+  oauthStates[state] = { returnTo, raterOnly, expires: Date.now() + 1000 * 60 * 10 }; // 10 min
 
   const params = new URLSearchParams({
     client_id: CLIENT_ID,
@@ -1176,6 +1200,9 @@ app.get('/auth/discord/callback', async (req, res) => {
     if (!profileRes.ok) return redirectWithError('No se pudo obtener el perfil de Discord');
 
     const discordId       = profile.id;
+    if (stateEntry.raterOnly && discordId !== RATER_OWNER_DISCORD_ID) {
+      return redirectWithError('El Rater está reservado temporalmente para su propietario.');
+    }
     const discordUsername = profile.username;
     const discordAvatar   = profile.avatar
       ? `https://cdn.discordapp.com/avatars/${profile.id}/${profile.avatar}.png?size=256`
