@@ -599,6 +599,17 @@ async function verifyToken(token) {
   return data[0].username;
 }
 
+// Rater access must observe session revocation immediately, so it deliberately skips
+// the in-memory cache used by the shared Vault/Rater convenience endpoints.
+async function verifyTokenFromStore(token) {
+  if (!token) return null;
+  const res = await fetch(`${SUPABASE_URL}/rest/v1/sessions?token=eq.${encodeURIComponent(token)}&limit=1`, {
+    headers: { 'apikey': SUPABASE_KEY, 'Authorization': `Bearer ${SUPABASE_KEY}` }
+  });
+  const data = await res.json();
+  return data[0]?.username || null;
+}
+
 async function deleteToken(token) {
   delete sessionCache[token];
   await fetch(`${SUPABASE_URL}/rest/v1/sessions?token=eq.${encodeURIComponent(token)}`, {
@@ -879,7 +890,7 @@ app.post('/verify', express.json(), async (req, res) => {
 app.post('/rater-access', express.json(), async (req, res) => {
   try {
     const { token } = req.body;
-    const username = await verifyToken(token);
+    const username = await verifyTokenFromStore(token);
     if (!username) return res.status(401).json({ error: 'Sesión inválida o expirada' });
 
     const user = await getUser(username);
