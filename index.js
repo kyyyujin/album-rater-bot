@@ -3,6 +3,7 @@ const multer    = require('multer');
 const fetch     = require('node-fetch');
 const FormData  = require('form-data');
 const sharp     = require('sharp');
+const puppeteer = require('puppeteer');
 const { Client, GatewayIntentBits, REST, Routes, SlashCommandBuilder, EmbedBuilder } = require('discord.js');
 
 const app    = express();
@@ -263,6 +264,167 @@ app.use((req, res, next) => {
   res.header('Access-Control-Allow-Methods', 'POST, GET, OPTIONS');
   if (req.method === 'OPTIONS') return res.sendStatus(200);
   next();
+});
+
+// ── Pixel-faithful rating export ──
+// A real Chromium compositor paints the same DOM/CSS used by the visible preview.
+let ratingExportBrowserPromise = null;
+const ratingExportRateLimits = new Map();
+
+function getRatingExportBrowser() {
+  if (!ratingExportBrowserPromise) {
+    ratingExportBrowserPromise = puppeteer.launch({
+      headless: true,
+      args: [
+        '--no-sandbox',
+        '--disable-setuid-sandbox',
+        '--disable-dev-shm-usage',
+        '--disable-gpu-sandbox',
+        '--font-render-hinting=medium'
+      ]
+    }).then(browser => {
+      browser.on('disconnected', () => { ratingExportBrowserPromise = null; });
+      return browser;
+    }).catch(error => {
+      ratingExportBrowserPromise = null;
+      throw error;
+    });
+  }
+  return ratingExportBrowserPromise;
+}
+
+function isPrivateRenderHost(hostname) {
+  const host = String(hostname || '').toLowerCase();
+  if (!host || host === 'localhost' || host.endsWith('.local')) return true;
+  if (host === '::1' || host.startsWith('fe80:') || host.startsWith('fc') || host.startsWith('fd')) return true;
+  if (/^127\./.test(host) || /^10\./.test(host) || /^192\.168\./.test(host) || /^169\.254\./.test(host)) return true;
+  const match = host.match(/^172\.(\d{1,3})\./);
+  return Boolean(match && Number(match[1]) >= 16 && Number(match[1]) <= 31);
+}
+
+function allowRatingExportRequest(url) {
+  if (url === 'about:blank' || url.startsWith('data:')) return true;
+  try {
+    const parsed = new URL(url);
+    return parsed.protocol === 'https:' && !isPrivateRenderHost(parsed.hostname);
+  } catch (_) {
+    return false;
+  }
+}
+
+function escapeHtmlAttribute(value) {
+  return String(value).replace(/&/g, '&amp;').replace(/"/g, '&quot;');
+}
+
+app.post('/render-rating', express.json({ limit: '3mb' }), async (req, res) => {
+  const now = Date.now();
+  const ip = req.ip || req.socket.remoteAddress || 'unknown';
+  const recent = (ratingExportRateLimits.get(ip) || []).filter(time => now - time < 60_000);
+  if (recent.length >= 10) return res.status(429).json({ error: 'Demasiadas exportaciones; espera un minuto.' });
+  recent.push(now);
+  ratingExportRateLimits.set(ip, recent);
+
+  let page = null;
+  try {
+    const { token, cardHtml, cssText, fontUrls, viewportWidth, viewportHeight, cardWidth } = req.body || {};
+    const username = await verifyTokenFromStore(token);
+    if (!username) return res.status(401).json({ error: 'Sesión inválida o expirada' });
+
+    if (typeof cardHtml !== 'string' || !cardHtml.includes('out-card') || cardHtml.length > 900_000) {
+      return res.status(400).json({ error: 'Preview inválida' });
+    }
+    if (typeof cssText !== 'string' || cssText.length > 1_500_000) {
+      return res.status(400).json({ error: 'Estilos inválidos' });
+    }
+    if (/<\/?(?:script|iframe|object|embed|link|meta|base)\b/i.test(cardHtml) || /\son[a-z]+\s*=/i.test(cardHtml)) {
+      return res.status(400).json({ error: 'Contenido no permitido en la preview' });
+    }
+
+    const safeViewportWidth = Math.max(320, Math.min(2400, Math.round(Number(viewportWidth) || 960)));
+    const safeViewportHeight = Math.max(600, Math.min(2400, Math.round(Number(viewportHeight) || 900)));
+    const safeCardWidth = Math.max(280, Math.min(safeViewportWidth, Math.round(Number(cardWidth) || 960)));
+    const deviceScaleFactor = Math.max(1.5, Math.min(4, 1920 / safeCardWidth));
+    const safeFonts = Array.isArray(fontUrls)
+      ? fontUrls.filter(url => /^https:\/\/fonts\.googleapis\.com\//i.test(String(url))).slice(0, 4)
+      : [];
+
+    const browser = await getRatingExportBrowser();
+    page = await browser.newPage();
+    await page.setViewport({
+      width: safeViewportWidth,
+      height: safeViewportHeight,
+      deviceScaleFactor
+    });
+    await page.setRequestInterception(true);
+    page.on('request', request => {
+      if (allowRatingExportRequest(request.url())) request.continue();
+      else request.abort('blockedbyclient');
+    });
+
+    const fontLinks = safeFonts.map(url => `<link rel="stylesheet" href="${escapeHtmlAttribute(url)}">`).join('');
+    const documentHtml = `<!doctype html>
+<html lang="es">
+<head>
+<meta charset="utf-8">
+<meta http-equiv="Content-Security-Policy" content="default-src 'none'; img-src data: https:; style-src 'unsafe-inline' https://fonts.googleapis.com; font-src data: https://fonts.gstatic.com; connect-src 'none'; script-src 'none'; object-src 'none';">
+${fontLinks}
+<style>${cssText}</style>
+<style>
+  html,body{margin:0!important;padding:0!important;width:${safeViewportWidth}px!important;height:auto!important;min-height:0!important;overflow:visible!important;background:transparent!important;}
+  body{display:block!important;}
+  #rating-capture-root{display:flow-root;width:${safeCardWidth}px;height:auto;min-height:0;margin:0;padding:0;overflow:visible;}
+  #rating-capture-root>.out-card{display:block;width:100%!important;height:auto!important;min-height:0!important;margin:0!important;}
+</style>
+</head>
+<body><main id="rating-capture-root">${cardHtml}</main></body>
+</html>`;
+
+    await page.setContent(documentHtml, { waitUntil: 'domcontentloaded', timeout: 30_000 });
+    await page.waitForNetworkIdle({ idleTime: 350, timeout: 10_000 }).catch(() => {});
+    await page.evaluate(async () => {
+      if (document.fonts?.ready) await document.fonts.ready;
+      await Promise.all(Array.from(document.images).map(async image => {
+        if (image.complete) {
+          try { await image.decode(); } catch (_) {}
+          return;
+        }
+        await new Promise(resolve => {
+          const done = () => resolve();
+          image.addEventListener('load', done, { once: true });
+          image.addEventListener('error', done, { once: true });
+          setTimeout(done, 8_000);
+        });
+      }));
+      await new Promise(resolve => setTimeout(resolve, 650));
+    });
+
+    const card = await page.$('#rating-capture-root > .out-card');
+    if (!card) throw new Error('Chromium no encontró la preview');
+    const box = await card.boundingBox();
+    if (!box || box.width < 1 || box.height < 1 || box.height > 5000) {
+      throw new Error('Dimensiones de preview inválidas');
+    }
+
+    const chromiumPng = await card.screenshot({
+      type: 'png',
+      omitBackground: true,
+      captureBeyondViewport: true
+    });
+    const png = await sharp(chromiumPng)
+      .resize({ width: 1920, withoutEnlargement: false })
+      .png({ compressionLevel: 9 })
+      .toBuffer();
+
+    res.set('Content-Type', 'image/png');
+    res.set('Cache-Control', 'no-store');
+    res.set('X-Rating-Renderer', 'chromium');
+    res.send(png);
+  } catch (error) {
+    console.error('[render-rating]', error);
+    res.status(500).json({ error: 'No se pudo renderizar la exportación con Chromium' });
+  } finally {
+    if (page) await page.close().catch(() => {});
+  }
 });
 
 async function changeBotPfp(coverUrl) {
