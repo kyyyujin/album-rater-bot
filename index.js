@@ -317,6 +317,38 @@ function escapeHtmlAttribute(value) {
   return String(value).replace(/&/g, '&amp;').replace(/"/g, '&quot;');
 }
 
+// Verifica el compositor real que usa /render-rating. La promesa se comparte para
+// no abrir páginas nuevas en cada consulta mientras diagnosticamos el servicio.
+let ratingRendererHealthPromise = null;
+app.get('/render-rating/health', async (_req, res) => {
+  if (!ratingRendererHealthPromise) {
+    ratingRendererHealthPromise = (async () => {
+      let page = null;
+      try {
+        const browser = await getRatingExportBrowser();
+        page = await browser.newPage();
+        await page.setViewport({ width: 320, height: 180, deviceScaleFactor: 1 });
+        await page.setContent('<main style="width:160px;height:90px;background:#123;color:#fff">ok</main>');
+        const element = await page.$('main');
+        const png = await element.screenshot({ type: 'png' });
+        return { ok: true, renderer: 'chromium', bytes: png.length };
+      } finally {
+        if (page) await page.close().catch(() => {});
+      }
+    })().catch(error => {
+      ratingRendererHealthPromise = null;
+      return {
+        ok: false,
+        renderer: 'chromium',
+        error: String(error && error.message ? error.message : error).slice(0, 800)
+      };
+    });
+  }
+
+  const result = await ratingRendererHealthPromise;
+  res.status(result.ok ? 200 : 503).json(result);
+});
+
 app.post('/render-rating', express.json({ limit: '3mb' }), async (req, res) => {
   const now = Date.now();
   const ip = req.ip || req.socket.remoteAddress || 'unknown';
