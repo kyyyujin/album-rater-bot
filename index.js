@@ -14,6 +14,10 @@ const CLIENT_ID    = process.env.CLIENT_ID;
 const SUPABASE_URL = process.env.SUPABASE_URL;
 const SUPABASE_KEY = process.env.SUPABASE_KEY;
 
+// Apagado por defecto para evitar que /spotify-load una decenas de miles de streams en memoria.
+// Para restaurarlo: configurar SPOTIFY_LOAD_ENABLED=true en Render.
+const SPOTIFY_LOAD_ENABLED = process.env.SPOTIFY_LOAD_ENABLED === 'true';
+
 // ── Discord OAuth (login web, distinto del bot de gateway) ──
 // CLIENT_ID se reutiliza (es la misma app de Discord que ya tenés).
 const DISCORD_CLIENT_SECRET = process.env.DISCORD_CLIENT_SECRET; // Nuevo: sacalo de Discord Developer Portal → OAuth2
@@ -645,6 +649,9 @@ app.post('/spotify-save', express.json({ limit: '10mb' }), async (req, res) => {
 
 // ── Spotify streams: load all chunks and merge ──
 app.get('/spotify-load', async (req, res) => {
+  // Mantiene la respuesta compatible con el frontend sin consultar ni unir chunks.
+  if (!SPOTIFY_LOAD_ENABLED) return res.json({ streams: null, temporarily_disabled: true });
+
   try {
     const { user_id } = req.query;
     if (!user_id) return res.status(400).json({ error: 'No user_id provided' });
