@@ -261,7 +261,7 @@ const PFP_COOLDOWN_MS = 35 * 60 * 1000;
 app.use((req, res, next) => {
   res.header('Access-Control-Allow-Origin', '*');
   res.header('Access-Control-Allow-Headers', 'Content-Type');
-  res.header('Access-Control-Expose-Headers', 'X-Rating-Renderer');
+  res.header('Access-Control-Expose-Headers', 'X-Rating-Renderer, X-Rating-Image-Width');
   res.header('Access-Control-Allow-Methods', 'POST, GET, OPTIONS');
   if (req.method === 'OPTIONS') return res.sendStatus(200);
   next();
@@ -349,6 +349,13 @@ app.get('/render-rating/health', async (_req, res) => {
   res.status(result.ok ? 200 : 503).json(result);
 });
 
+// Contrato canónico: toda exportación se compone como escritorio, aunque la
+// petición venga de un teléfono, y termina en un PNG de 1920 px de ancho.
+const RATING_EXPORT_VIEWPORT_WIDTH = 1440;
+const RATING_EXPORT_VIEWPORT_HEIGHT = 2600;
+const RATING_EXPORT_CARD_WIDTH = 1280;
+const RATING_EXPORT_IMAGE_WIDTH = 1920;
+
 app.post('/render-rating', express.json({ limit: '3mb' }), async (req, res) => {
   const now = Date.now();
   const ip = req.ip || req.socket.remoteAddress || 'unknown';
@@ -359,7 +366,7 @@ app.post('/render-rating', express.json({ limit: '3mb' }), async (req, res) => {
 
   let page = null;
   try {
-    const { token, cardHtml, cssText, fontUrls, viewportWidth, viewportHeight, cardWidth } = req.body || {};
+    const { token, cardHtml, cssText, fontUrls } = req.body || {};
     const username = await verifyTokenFromStore(token);
     if (!username) return res.status(401).json({ error: 'Sesión inválida o expirada' });
 
@@ -373,10 +380,10 @@ app.post('/render-rating', express.json({ limit: '3mb' }), async (req, res) => {
       return res.status(400).json({ error: 'Contenido no permitido en la preview' });
     }
 
-    const safeViewportWidth = Math.max(320, Math.min(2400, Math.round(Number(viewportWidth) || 960)));
-    const safeViewportHeight = Math.max(600, Math.min(2400, Math.round(Number(viewportHeight) || 900)));
-    const safeCardWidth = Math.max(280, Math.min(safeViewportWidth, Math.round(Number(cardWidth) || 960)));
-    const deviceScaleFactor = Math.max(1.5, Math.min(4, 1920 / safeCardWidth));
+    const safeViewportWidth = RATING_EXPORT_VIEWPORT_WIDTH;
+    const safeViewportHeight = RATING_EXPORT_VIEWPORT_HEIGHT;
+    const safeCardWidth = RATING_EXPORT_CARD_WIDTH;
+    const deviceScaleFactor = Math.max(1.5, Math.min(4, RATING_EXPORT_IMAGE_WIDTH / safeCardWidth));
     const safeFonts = Array.isArray(fontUrls)
       ? fontUrls.filter(url => /^https:\/\/fonts\.googleapis\.com\//i.test(String(url))).slice(0, 4)
       : [];
@@ -444,13 +451,14 @@ ${fontLinks}
       captureBeyondViewport: true
     });
     const png = await sharp(chromiumPng)
-      .resize({ width: 1920, withoutEnlargement: false })
+      .resize({ width: RATING_EXPORT_IMAGE_WIDTH, withoutEnlargement: false })
       .png({ compressionLevel: 9 })
       .toBuffer();
 
     res.set('Content-Type', 'image/png');
     res.set('Cache-Control', 'no-store');
     res.set('X-Rating-Renderer', 'chromium');
+    res.set('X-Rating-Image-Width', String(RATING_EXPORT_IMAGE_WIDTH));
     res.send(png);
   } catch (error) {
     console.error('[render-rating]', error);
