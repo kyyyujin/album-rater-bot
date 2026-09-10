@@ -418,13 +418,15 @@ ${fontLinks}
   body{display:block!important;}
   #rating-capture-root{display:flow-root;width:${safeCardWidth}px;height:auto;min-height:0;margin:0;padding:0;overflow:visible;}
   #rating-capture-root>.out-card{display:block;width:100%!important;height:auto!important;min-height:0!important;margin:0!important;}
+  /* La captura no necesita animaciones; desactivarlas evita esperar a que terminen. */
+  #rating-capture-root,#rating-capture-root *{animation:none!important;transition:none!important;}
 </style>
 </head>
 <body><main id="rating-capture-root">${cardHtml}</main></body>
 </html>`;
 
     await page.setContent(documentHtml, { waitUntil: 'domcontentloaded', timeout: 30_000 });
-    await page.waitForNetworkIdle({ idleTime: 350, timeout: 10_000 }).catch(() => {});
+    await page.waitForNetworkIdle({ idleTime: 120, timeout: 5_000 }).catch(() => {});
     await page.evaluate(async () => {
       if (document.fonts?.ready) await document.fonts.ready;
       await Promise.all(Array.from(document.images).map(async image => {
@@ -439,7 +441,7 @@ ${fontLinks}
           setTimeout(done, 8_000);
         });
       }));
-      await new Promise(resolve => setTimeout(resolve, 650));
+      await new Promise(resolve => setTimeout(resolve, 100));
     });
 
     const card = await page.$('#rating-capture-root > .out-card');
@@ -456,7 +458,7 @@ ${fontLinks}
     });
     const png = await sharp(chromiumPng)
       .resize({ width: RATING_EXPORT_IMAGE_WIDTH, withoutEnlargement: false })
-      .png({ compressionLevel: 9 })
+      .png({ compressionLevel: 6 })
       .toBuffer();
 
     res.set('Content-Type', 'image/png');
