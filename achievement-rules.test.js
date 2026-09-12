@@ -1,0 +1,26 @@
+'use strict';
+const assert = require('assert');
+const { evaluate, substantialReview } = require('./achievement-rules');
+const album = (id, score, tracks = {}) => ({ id, title:'Album '+id, artist:'Artist '+id, score, status:'listened', genres:['Kpop'], year:2020, trackScores:tracks });
+const event = (type, a, extra={}) => ({ type, occurred_at:extra.occurred_at || '2026-01-01T00:00:00Z', payload:{ album_id:String(a.id), album:a, ...extra } });
+const has = (r,key,l=1) => r.some(x => x.key===key && x.level===l);
+let c = { albums:[album(1,8)] }; assert(has(evaluate({collection:c,event:event('album_rated',c.albums[0])}),'the_beginning'));
+c = { albums:Array.from({length:10},(_,i)=>album(i,8)) }; assert(has(evaluate({collection:c,event:event('album_rated',c.albums[0])}),'archivist'));
+c.albums[0].score=10; assert(has(evaluate({collection:c,event:event('album_rated',c.albums[0])}),'masterpiece'));
+c.albums[1].score=3; assert(has(evaluate({collection:c,event:event('album_rated',c.albums[1])}),'savage'));
+let a=album(1,8); let e=event('album_rescored',a,{previous_score:8,new_score:9,delta:1,previous_at:'2025-01-01T00:00:00Z'}); let r=evaluate({collection:{albums:[a]},event:e,priorEvents:[event('album_rated',album(1,8),{score:8,occurred_at:'2025-01-01T00:00:00Z'})]}); assert(has(r,'second_thoughts')&&has(r,'it_grew_on_me')&&has(r,'aged_like_wine'));
+a.score=7; e=event('album_rescored',a,{previous_score:8,new_score:7,delta:-1,previous_at:'2025-12-01T00:00:00Z'}); assert(has(evaluate({collection:{albums:[a]},event:e}),'what_was_i_thinking'));
+const no=album(2,9, {a:9,b:9,c:9,d:9,e:9,f:9}); assert(has(evaluate({collection:{albums:[no]},event:event('track_scores_saved',no)}),'no_skip'));
+const bal=album(3,8,{a:8,b:8.1,c:8.2,d:8.1,e:8,f:8.2}); assert(has(evaluate({collection:{albums:[bal]},event:event('track_scores_saved',bal)}),'perfectly_balanced'));
+const roll=album(4,7,{a:3,b:4,c:5,d:6,e:7,f:9}); assert(has(evaluate({collection:{albums:[roll]},event:event('track_scores_saved',roll)}),'roller_coaster'));
+const one=album(5,5,{a:9,b:4,c:4,d:4,e:4}); assert(has(evaluate({collection:{albums:[one]},event:event('track_scores_saved',one)}),'one_good_song'));
+assert(substantialReview('This is a thoughtful review with actual words.', album(6,8))); assert(!substantialReview('Album 6 Artist 6', album(6,8)));
+// ANTIFRAGILE is deliberately one album's recovery, never a global re-score counter.
+a=album(7,9.2); const initial=event('album_rated',album(7,8),{score:8,occurred_at:'2025-01-01T00:00:00Z'});
+const r1=event('album_rescored',a,{previous_score:8,new_score:8.3,delta:.3,occurred_at:'2025-02-01T00:00:00Z'});
+const r2=event('album_rescored',a,{previous_score:8.3,new_score:8.7,delta:.4,occurred_at:'2025-03-01T00:00:00Z'});
+const r3=event('album_rescored',a,{previous_score:8.7,new_score:9.2,delta:.5,occurred_at:'2025-04-01T00:00:00Z'});
+r=evaluate({collection:{albums:[a]},event:r3,priorEvents:[initial,r1,r2]}); assert(has(r,'antifragile',1)&&has(r,'antifragile',2)&&has(r,'antifragile',3));
+const review=event('review_written',a,{substantial:true,excerpt:'A real review with enough words',occurred_at:'2025-01-01T00:00:00Z'});
+r=evaluate({collection:{albums:[a]},event:event('album_rescored',a,{previous_score:8,new_score:8.8,delta:.8,occurred_at:'2025-02-02T00:00:00Z'}),priorEvents:[review]}); assert(has(r,'talk_that_talk'));
+console.log('achievement-rules tests passed');
