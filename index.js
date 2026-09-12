@@ -7,16 +7,17 @@ const puppeteer = require('puppeteer');
 const { Client, GatewayIntentBits, REST, Routes, SlashCommandBuilder, EmbedBuilder } = require('discord.js');
 
 const app    = express();
-const upload = multer({ storage: multer.memoryStorage() });
+// Las imágenes de Discord se procesan en memoria; un límite explícito evita que
+// una subida anómala lleve el proceso de Render al límite antes de ser rechazada.
+const upload = multer({
+  storage: multer.memoryStorage(),
+  limits: { fileSize: 8 * 1024 * 1024, files: 1, fields: 24, fieldSize: 512 * 1024, parts: 28 }
+});
 
 const BOT_TOKEN    = process.env.BOT_TOKEN;
 const CLIENT_ID    = process.env.CLIENT_ID;
 const SUPABASE_URL = process.env.SUPABASE_URL;
 const SUPABASE_KEY = process.env.SUPABASE_KEY;
-
-// Apagado por defecto para evitar que /spotify-load una decenas de miles de streams en memoria.
-// Para restaurarlo: configurar SPOTIFY_LOAD_ENABLED=true en Render.
-const SPOTIFY_LOAD_ENABLED = process.env.SPOTIFY_LOAD_ENABLED === 'true';
 
 // ── Discord OAuth (login web, distinto del bot de gateway) ──
 // CLIENT_ID se reutiliza (es la misma app de Discord que ya tenés).
@@ -353,8 +354,9 @@ app.get('/render-rating/health', async (_req, res) => {
   res.status(result.ok ? 200 : 503).json(result);
 });
 
-// Contrato canónico: toda exportación se compone como escritorio, aunque la
-// petición venga de un teléfono, y termina en un PNG de 1920 px de ancho.
+// The master rating export is intentionally desktop-only. A phone can request
+// it, but its viewport must never change the visual composition sent to Discord
+// or downloaded as PNG.
 const RATING_EXPORT_VIEWPORT_WIDTH = 1440;
 const RATING_EXPORT_VIEWPORT_HEIGHT = 2600;
 const RATING_EXPORT_CARD_WIDTH = 1280;
@@ -418,15 +420,13 @@ ${fontLinks}
   body{display:block!important;}
   #rating-capture-root{display:flow-root;width:${safeCardWidth}px;height:auto;min-height:0;margin:0;padding:0;overflow:visible;}
   #rating-capture-root>.out-card{display:block;width:100%!important;height:auto!important;min-height:0!important;margin:0!important;}
-  /* La captura no necesita animaciones; desactivarlas evita esperar a que terminen. */
-  #rating-capture-root,#rating-capture-root *{animation:none!important;transition:none!important;}
 </style>
 </head>
 <body><main id="rating-capture-root">${cardHtml}</main></body>
 </html>`;
 
     await page.setContent(documentHtml, { waitUntil: 'domcontentloaded', timeout: 30_000 });
-    await page.waitForNetworkIdle({ idleTime: 120, timeout: 5_000 }).catch(() => {});
+    await page.waitForNetworkIdle({ idleTime: 350, timeout: 10_000 }).catch(() => {});
     await page.evaluate(async () => {
       if (document.fonts?.ready) await document.fonts.ready;
       await Promise.all(Array.from(document.images).map(async image => {
@@ -441,7 +441,7 @@ ${fontLinks}
           setTimeout(done, 8_000);
         });
       }));
-      await new Promise(resolve => setTimeout(resolve, 100));
+      await new Promise(resolve => setTimeout(resolve, 650));
     });
 
     const card = await page.$('#rating-capture-root > .out-card');
@@ -458,7 +458,7 @@ ${fontLinks}
     });
     const png = await sharp(chromiumPng)
       .resize({ width: RATING_EXPORT_IMAGE_WIDTH, withoutEnlargement: false })
-      .png({ compressionLevel: 6 })
+      .png({ compressionLevel: 9 })
       .toBuffer();
 
     res.set('Content-Type', 'image/png');
@@ -651,9 +651,6 @@ app.post('/spotify-save', express.json({ limit: '10mb' }), async (req, res) => {
 
 // ── Spotify streams: load all chunks and merge ──
 app.get('/spotify-load', async (req, res) => {
-  // Mantiene la respuesta compatible con el frontend sin consultar ni unir chunks.
-  if (!SPOTIFY_LOAD_ENABLED) return res.json({ streams: null, temporarily_disabled: true });
-
   try {
     const { user_id } = req.query;
     if (!user_id) return res.status(400).json({ error: 'No user_id provided' });
@@ -1146,7 +1143,10 @@ app.post('/work-in-progress/get', express.json(), async (req, res) => {
 
 // ── Colección de Album Vault: guardar / recuperar ──
 // Mismo patrón que /work-in-progress, para la app de Vault (login compartido con Rater).
-app.post('/vault-collection', express.json(), async (req, res) => {
+// Una colección grande (cientos de álbumes con tracks/reseñas) supera con
+// facilidad el límite por defecto de Express (100 KB). El límite sigue siendo
+// acotado para no permitir cuerpos arbitrarios en memoria.
+app.post('/vault-collection', express.json({ limit: '2mb' }), async (req, res) => {
   try {
     const { token, collection } = req.body;
     const username = await verifyToken(token);
@@ -1493,6 +1493,18 @@ app.post('/auth/discord/finish', express.json(), async (req, res) => {
     console.error('[discord oauth finish] error:', err.message);
     res.status(500).json({ error: err.message });
   }
+});
+
+// Respuesta compacta y observable para cuerpos demasiado grandes. Sin este
+// manejador Express imprimía el stack completo repetidamente y el cliente no
+// recibía una causa útil para detener el intento.
+app.use((err, req, res, next) => {
+  if (err?.type === 'entity.too.large' || err?.code === 'LIMIT_FILE_SIZE') {
+    const size = req.headers['content-length'] || 'desconocido';
+    console.warn(`[payload-too-large] ${req.method} ${req.path} content-length=${size}`);
+    return res.status(413).json({ error: 'Payload demasiado grande para esta operación.' });
+  }
+  next(err);
 });
 
 const PORT = process.env.PORT || 3000;
