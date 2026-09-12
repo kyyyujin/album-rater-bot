@@ -5,6 +5,7 @@ const FormData  = require('form-data');
 const sharp     = require('sharp');
 const puppeteer = require('puppeteer');
 const { Client, GatewayIntentBits, REST, Routes, SlashCommandBuilder, EmbedBuilder } = require('discord.js');
+const AchievementRules = require('./achievement-rules');
 
 const app    = express();
 // Las imágenes de Discord se procesan en memoria; un límite explícito evita que
@@ -920,6 +921,78 @@ async function getVaultCollection(username) {
   return data[0]?.vault_collection || null;
 }
 
+const sbHeaders = () => ({ 'Content-Type': 'application/json', 'apikey': SUPABASE_KEY, 'Authorization': `Bearer ${SUPABASE_KEY}` });
+async function sb(path, options = {}) {
+  const res = await fetch(`${SUPABASE_URL}/rest/v1/${path}`, { ...options, headers: { ...sbHeaders(), ...(options.headers || {}) } });
+  const text = await res.text(); let data = null; try { data = text ? JSON.parse(text) : null; } catch (_) { data = text; }
+  if (!res.ok) throw new Error(typeof data === 'string' ? data : JSON.stringify(data));
+  return data;
+}
+let achievementDefinitionsReady = false;
+async function ensureAchievementDefinitions() {
+  if (achievementDefinitionsReady) return;
+  const rows = AchievementRules.DEFINITIONS.map(d => ({ key:d.key,title:d.title,category:d.category,rarity:d.rarity,max_level:d.maxLevel,rule_version:d.ruleVersion,enabled:true,client_metadata:{ badge:d.key } }));
+  await sb('vault_achievement_definitions?on_conflict=key', { method:'POST', headers:{ Prefer:'resolution=merge-duplicates,return=minimal' }, body:JSON.stringify(rows) });
+  achievementDefinitionsReady = true;
+}
+async function saveCollectionWithAchievementEvents(username, collection, events) {
+  const rows = await sb('rpc/achievement_save_collection_events', { method:'POST', body:JSON.stringify({ p_username:username, p_collection:collection || {}, p_events:events || [] }) });
+  return rows || [];
+}
+async function getAchievementEvents(username, albumId = null) {
+  let q = `vault_achievement_events?user_id=eq.${encodeURIComponent(username)}&select=event_id,occurred_at,type,payload,source,processed_at&order=occurred_at.asc`;
+  const rows = await sb(q);
+  return albumId ? rows.filter(e => String(e.payload?.album_id || '') === String(albumId)) : rows;
+}
+async function writeProgress(username, candidates) {
+  const max = new Map(); candidates.forEach(c => { const old=max.get(c.key); if (!old || c.level > old.level) max.set(c.key,c); });
+  const rows = [...max.values()].map(c => ({ user_id:username, achievement_key:c.key, current_level:c.level, current_value:c.currentValue ?? null, target_value:c.targetValue ?? null, evaluated_at:new Date().toISOString() }));
+  if (rows.length) await sb('vault_achievement_progress?on_conflict=user_id,achievement_key', { method:'POST', headers:{ Prefer:'resolution=merge-duplicates,return=minimal' }, body:JSON.stringify(rows) });
+}
+async function refreshRatingRecords(username, collection) {
+  const records=[];
+  for (const album of (collection?.albums || [])) {
+    const h=(album.scoreHistory || []).map(x=>AchievementRules.score(x?.score)).filter(x=>x!==null);
+    for(let i=1;i<h.length;i++) { const d=AchievementRules.score(h[i]-h[i-1]);
+      if(d>0) records.push({kind:'biggest_rating_comeback',delta:d,album});
+      if(d<0) records.push({kind:'biggest_rating_drop',delta:Math.abs(d),album});
+    }
+  }
+  const rows=[];
+  for (const kind of ['biggest_rating_comeback','biggest_rating_drop']) { const r=records.filter(x=>x.kind===kind).sort((a,b)=>b.delta-a.delta)[0]; if(r) rows.push({user_id:username,record_key:kind,value:{delta:r.delta,album:AchievementRules.brief(r.album)},observed_at:new Date().toISOString(),updated_at:new Date().toISOString()}); }
+  if(rows.length) await sb('vault_personal_records?on_conflict=user_id,record_key',{method:'POST',headers:{Prefer:'resolution=merge-duplicates,return=minimal'},body:JSON.stringify(rows)});
+}
+async function processAchievementEvent(username, eventId) {
+  const events = await getAchievementEvents(username);
+  const event = events.find(e=>e.event_id===eventId); if (!event || event.processed_at) return [];
+  const collection = await getVaultCollection(username) || { albums:[] };
+  const candidates = AchievementRules.evaluate({ collection, event, priorEvents:events.filter(e=>e.event_id!==eventId) });
+  await writeProgress(username, candidates);
+  const unlocks=[];
+  for (const c of candidates) {
+    const definition=AchievementRules.DEFINITIONS.find(d=>d.key===c.key); if(!definition) continue;
+    const snapshot={ ...c.snapshot, source:event.source, occurred_at:event.occurred_at, rule_version:definition.ruleVersion };
+    const inserted=await sb('vault_achievement_unlocks?on_conflict=user_id,achievement_key,level',{method:'POST',headers:{Prefer:'resolution=ignore-duplicates,return=representation'},body:JSON.stringify({user_id:username,achievement_key:c.key,level:c.level,unlocked_at:new Date().toISOString(),source:event.source,rule_version:definition.ruleVersion,snapshot})});
+    if(Array.isArray(inserted)&&inserted[0]) { unlocks.push(inserted[0]); if (event.source !== 'baseline_activation') await sb('vault_achievement_inbox',{method:'POST',headers:{Prefer:'return=minimal'},body:JSON.stringify({user_id:username,unlock_id:inserted[0].id,source:event.source})}); }
+  }
+  await refreshRatingRecords(username, collection);
+  await sb(`vault_achievement_events?event_id=eq.${eventId}`,{method:'PATCH',headers:{Prefer:'return=minimal'},body:JSON.stringify({processed_at:new Date().toISOString(),unlock_ids:unlocks.map(u=>u.id)})});
+  return unlocks;
+}
+async function processAchievementEvents(username, eventIds) {
+  const all=[]; for (const id of eventIds || []) all.push(...await processAchievementEvent(username,id)); return all;
+}
+async function achievementReadModel(username) {
+  await ensureAchievementDefinitions();
+  const [defs,progress,unlocks,showcase,records,inbox,state] = await Promise.all([
+    sb('vault_achievement_definitions?enabled=eq.true&order=key.asc'), sb(`vault_achievement_progress?user_id=eq.${encodeURIComponent(username)}`),
+    sb(`vault_achievement_unlocks?user_id=eq.${encodeURIComponent(username)}&select=id,achievement_key,level,unlocked_at,source,public_visible&order=unlocked_at.desc`),
+    sb(`vault_achievement_showcase?user_id=eq.${encodeURIComponent(username)}&order=position.asc`), sb(`vault_personal_records?user_id=eq.${encodeURIComponent(username)}`),
+    sb(`vault_achievement_inbox?user_id=eq.${encodeURIComponent(username)}&delivered_at=is.null&order=created_at.asc`), sb(`vault_achievement_state?user_id=eq.${encodeURIComponent(username)}&limit=1`)
+  ]);
+  return { definitions:defs, progress, unlocks, showcase, records, inbox, baselineActivated:!!state?.[0]?.baseline_activated_at, availableCount:defs.length, unlockedFamilies:new Set(unlocks.map(u=>u.achievement_key)).size };
+}
+
 // ── Migración única de portadas de Vault ──
 // Corre en el servidor, no expone ninguna ruta pública ni modifica álbumes si
 // iTunes no devuelve exactamente el mismo título y artista.
@@ -1170,6 +1243,68 @@ app.post('/vault-collection/get', express.json(), async (req, res) => {
     console.error('[vault-collection get]', err.message);
     res.status(500).json({ error: 'No se pudo recuperar la colección' });
   }
+});
+
+// Phase 1 achievement events share the collection write through an RPC transaction.
+// The client may request a fact to be evaluated, but the server derives every unlock.
+app.post('/vault-collection/events', express.json({ limit: '2mb' }), async (req, res) => {
+  try {
+    const { token, collection, events } = req.body;
+    const username = await verifyToken(token);
+    if (!username) return res.status(401).json({ error: 'Sesión inválida o expirada' });
+    if (!Array.isArray(events) || !events.length || events.length > 30) return res.status(400).json({ error: 'Eventos inválidos' });
+    await ensureAchievementDefinitions();
+    const permitted = new Set(['album_rated','album_added','review_written','review_updated','album_rescored','track_scores_saved']);
+    for (const event of events) {
+      if (!permitted.has(event?.type) || !event?.idempotency_key || !event?.payload || String(event.idempotency_key).length > 240) return res.status(400).json({ error:'Evento incompleto' });
+      event.payload_version = 1; event.source = ['rater','vault'].includes(event.source) ? event.source : 'vault';
+      if (event.type === 'review_written' || event.type === 'review_updated') {
+        const album = event.payload.album || {};
+        const review = String(event.payload.review_text || '').slice(0, 12000);
+        event.payload.substantial = AchievementRules.substantialReview(review, album);
+        event.payload.excerpt = event.payload.substantial ? review.replace(/\s+/g,' ').trim().slice(0, 180) : null;
+        delete event.payload.review_text;
+      }
+    }
+    const saved = await saveCollectionWithAchievementEvents(username, collection ?? {}, events);
+    const unlocks = await processAchievementEvents(username, saved.map(x=>x.event_id));
+    res.json({ ok:true, eventIds:saved.map(x=>x.event_id), unlocks:unlocks.map(x=>x.id) });
+  } catch (err) { console.error('[achievement events]',err.message); res.status(500).json({ error:'No se pudieron guardar los eventos del Vault' }); }
+});
+
+app.post('/achievements/activate', express.json(), async (req,res) => {
+  try {
+    const username=await verifyToken(req.body?.token); if(!username) return res.status(401).json({error:'Sesión inválida o expirada'});
+    await ensureAchievementDefinitions();
+    const existing=await sb(`vault_achievement_state?user_id=eq.${encodeURIComponent(username)}&select=baseline_activated_at&limit=1`);
+    if (!existing?.[0]?.baseline_activated_at) {
+      const collection=await getVaultCollection(username) || {albums:[]};
+      const event={ event_id:crypto.randomUUID(), occurred_at:new Date().toISOString(), type:'collection_baselined', payload_version:1, source:'baseline_activation', idempotency_key:'phase1-baseline-v1', payload:{ baseline_version:1 } };
+      const saved=await saveCollectionWithAchievementEvents(username,collection,[event]);
+      await processAchievementEvents(username,saved.map(x=>x.event_id));
+      await sb('vault_achievement_state?on_conflict=user_id',{method:'POST',headers:{Prefer:'resolution=merge-duplicates,return=minimal'},body:JSON.stringify({user_id:username,baseline_activated_at:new Date().toISOString(),baseline_version:1,last_evaluated_at:new Date().toISOString()})});
+    }
+    res.json({ok:true, ...(await achievementReadModel(username))});
+  } catch(err) { console.error('[achievement baseline]',err.message); res.status(500).json({error:'No se pudo activar Achievement Vault'}); }
+});
+app.post('/achievements/me', express.json(), async (req,res) => {
+  try { const username=await verifyToken(req.body?.token); if(!username) return res.status(401).json({error:'Sesión inválida o expirada'}); res.json({ok:true,...(await achievementReadModel(username))}); }
+  catch(err) { console.error('[achievement read]',err.message); res.status(500).json({error:'No se pudieron leer los achievements'}); }
+});
+app.post('/achievements/inbox/consume', express.json(), async (req,res) => {
+  try { const username=await verifyToken(req.body?.token); if(!username) return res.status(401).json({error:'Sesión inválida o expirada'}); const ids=(req.body?.ids||[]).filter(x=>typeof x==='string').slice(0,20); if(ids.length) await sb(`vault_achievement_inbox?user_id=eq.${encodeURIComponent(username)}&id=in.(${ids.map(encodeURIComponent).join(',')})`,{method:'PATCH',headers:{Prefer:'return=minimal'},body:JSON.stringify({delivered_at:new Date().toISOString()})}); res.json({ok:true}); }
+  catch(err) { console.error('[achievement inbox]',err.message); res.status(500).json({error:'No se pudo actualizar la bandeja'}); }
+});
+app.post('/achievements/showcase', express.json(), async (req,res) => {
+  try {
+    const username=await verifyToken(req.body?.token); if(!username) return res.status(401).json({error:'Sesión inválida o expirada'});
+    const keys=[...new Set((req.body?.keys||[]).filter(x=>typeof x==='string'))].slice(0,6);
+    const unlocked=await sb(`vault_achievement_unlocks?user_id=eq.${encodeURIComponent(username)}&select=achievement_key`); const allowed=new Set(unlocked.map(x=>x.achievement_key));
+    if(keys.some(k=>!allowed.has(k))) return res.status(400).json({error:'Solo podés exhibir achievements desbloqueados'});
+    await sb(`vault_achievement_showcase?user_id=eq.${encodeURIComponent(username)}`,{method:'DELETE',headers:{Prefer:'return=minimal'}});
+    if(keys.length) await sb('vault_achievement_showcase',{method:'POST',headers:{Prefer:'return=minimal'},body:JSON.stringify(keys.map((achievement_key,i)=>({user_id:username,achievement_key,position:i+1})))});
+    res.json({ok:true,keys});
+  } catch(err) { console.error('[achievement showcase]',err.message); res.status(500).json({error:'No se pudo guardar el showcase'}); }
 });
 
 // ── Perfil de Vault: guardar / recuperar ──
