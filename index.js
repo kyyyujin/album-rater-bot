@@ -776,6 +776,10 @@ app.get('/', (req, res) => res.send('Album Rater Bot — OK'));
 const bcrypt = require('bcrypt');
 const crypto = require('crypto');
 const ADMIN_USER = 'kyujin';
+// Private rollout: Phase 1 data and UI are enabled only for the owner until
+// the beta is explicitly opened. Backend enforcement prevents crafted clients.
+const ACHIEVEMENT_BETA_USER = ADMIN_USER;
+function isAchievementBetaUser(username) { return String(username || '').trim().toLowerCase() === ACHIEVEMENT_BETA_USER; }
 
 // Las sesiones ahora se persisten en Supabase (tabla "sessions") en vez de
 // vivir solo en memoria — así sobreviven a un redeploy/reinicio de Render.
@@ -1252,6 +1256,7 @@ app.post('/vault-collection/events', express.json({ limit: '2mb' }), async (req,
     const { token, collection, events } = req.body;
     const username = await verifyToken(token);
     if (!username) return res.status(401).json({ error: 'Sesión inválida o expirada' });
+    if (!isAchievementBetaUser(username)) { await saveVaultCollection(username, collection ?? null); return res.json({ ok:true, beta:false }); }
     if (!Array.isArray(events) || !events.length || events.length > 30) return res.status(400).json({ error: 'Eventos inválidos' });
     await ensureAchievementDefinitions();
     const permitted = new Set(['album_rated','album_added','review_written','review_updated','album_rescored','track_scores_saved']);
@@ -1275,6 +1280,7 @@ app.post('/vault-collection/events', express.json({ limit: '2mb' }), async (req,
 app.post('/achievements/activate', express.json(), async (req,res) => {
   try {
     const username=await verifyToken(req.body?.token); if(!username) return res.status(401).json({error:'Sesión inválida o expirada'});
+    if (!isAchievementBetaUser(username)) return res.json({ok:true,beta:false});
     await ensureAchievementDefinitions();
     const existing=await sb(`vault_achievement_state?user_id=eq.${encodeURIComponent(username)}&select=baseline_activated_at&limit=1`);
     if (!existing?.[0]?.baseline_activated_at) {
@@ -1288,16 +1294,17 @@ app.post('/achievements/activate', express.json(), async (req,res) => {
   } catch(err) { console.error('[achievement baseline]',err.message); res.status(500).json({error:'No se pudo activar Achievement Vault'}); }
 });
 app.post('/achievements/me', express.json(), async (req,res) => {
-  try { const username=await verifyToken(req.body?.token); if(!username) return res.status(401).json({error:'Sesión inválida o expirada'}); res.json({ok:true,...(await achievementReadModel(username))}); }
+  try { const username=await verifyToken(req.body?.token); if(!username) return res.status(401).json({error:'Sesión inválida o expirada'}); if(!isAchievementBetaUser(username)) return res.json({ok:true,beta:false}); res.json({ok:true,...(await achievementReadModel(username))}); }
   catch(err) { console.error('[achievement read]',err.message); res.status(500).json({error:'No se pudieron leer los achievements'}); }
 });
 app.post('/achievements/inbox/consume', express.json(), async (req,res) => {
-  try { const username=await verifyToken(req.body?.token); if(!username) return res.status(401).json({error:'Sesión inválida o expirada'}); const ids=(req.body?.ids||[]).filter(x=>typeof x==='string').slice(0,20); if(ids.length) await sb(`vault_achievement_inbox?user_id=eq.${encodeURIComponent(username)}&id=in.(${ids.map(encodeURIComponent).join(',')})`,{method:'PATCH',headers:{Prefer:'return=minimal'},body:JSON.stringify({delivered_at:new Date().toISOString()})}); res.json({ok:true}); }
+  try { const username=await verifyToken(req.body?.token); if(!username) return res.status(401).json({error:'Sesión inválida o expirada'}); if(!isAchievementBetaUser(username)) return res.json({ok:true,beta:false}); const ids=(req.body?.ids||[]).filter(x=>typeof x==='string').slice(0,20); if(ids.length) await sb(`vault_achievement_inbox?user_id=eq.${encodeURIComponent(username)}&id=in.(${ids.map(encodeURIComponent).join(',')})`,{method:'PATCH',headers:{Prefer:'return=minimal'},body:JSON.stringify({delivered_at:new Date().toISOString()})}); res.json({ok:true}); }
   catch(err) { console.error('[achievement inbox]',err.message); res.status(500).json({error:'No se pudo actualizar la bandeja'}); }
 });
 app.post('/achievements/showcase', express.json(), async (req,res) => {
   try {
     const username=await verifyToken(req.body?.token); if(!username) return res.status(401).json({error:'Sesión inválida o expirada'});
+    if (!isAchievementBetaUser(username)) return res.status(403).json({error:'Achievement Vault está en beta privada'});
     const keys=[...new Set((req.body?.keys||[]).filter(x=>typeof x==='string'))].slice(0,6);
     const unlocked=await sb(`vault_achievement_unlocks?user_id=eq.${encodeURIComponent(username)}&select=achievement_key`); const allowed=new Set(unlocked.map(x=>x.achievement_key));
     if(keys.some(k=>!allowed.has(k))) return res.status(400).json({error:'Solo podés exhibir achievements desbloqueados'});
