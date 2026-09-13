@@ -330,7 +330,7 @@ function escapeHtmlAttribute(value) {
 // Shared contract with Rater-Page. A split deploy must fail clearly instead of
 // silently producing a card with an older renderer.
 const RATING_EXPORT_REVISION = 'rater-export-20260913.2';
-const MUSIC_IDENTITY_REVISION = 'phase15-musicbrainz-release-groups.3';
+const MUSIC_IDENTITY_REVISION = 'phase15-musicbrainz-release-groups.4';
 app.get('/render-rating/health', (_req, res) => {
   try {
     // executablePath validates that Puppeteer resolved the installed browser
@@ -1022,7 +1022,7 @@ async function mbJson(path) {
   const run = mbRequestChain.then(async () => {
     const wait=Math.max(0,mbNextRequestAt-Date.now()); if(wait) await sleep(wait);
     mbNextRequestAt=Date.now()+1100; // MusicBrainz public API: at most one request/sec.
-    const url=`${MB_API_BASE}${path.includes('?')?'&':'?'}fmt=json`;
+    const url=`${MB_API_BASE}${path}${path.includes('?')?'&':'?'}fmt=json`;
     const response=await fetch(url,{headers:{Accept:'application/json','User-Agent':'AlbumVault/1.5 (identity resolver)'}});
     if(!response.ok) { const error=new Error(`MusicBrainz ${response.status}`); error.status=response.status; throw error; }
     return response.json();
@@ -1066,7 +1066,7 @@ async function findStrictReleaseGroup(album) {
   const title=String(album?.title||'').trim(), artist=String(album?.artist||'').trim();
   if(!title||!artist) return {status:'unresolved',note:'missing_title_or_artist'};
   const query=`releasegroup:${JSON.stringify(title)} AND artist:${JSON.stringify(artist)}`;
-  const result=await mbJson(`/release-group?query=${encodeURIComponent(query)}&limit=10`);
+  const result=await mbJson(`/release-group/?query=${encodeURIComponent(query)}&limit=10`);
   const exact=(result?.['release-groups']||[]).filter(group=>{
     const credit=mbArtistCredit(group);
     return identityText(group.title)===identityText(title) && credit && identityText(credit.name)===identityText(artist);
@@ -1088,7 +1088,7 @@ async function ensureArtistDiscography(artistRow) {
   // A bounded pagination cap protects a worker from unexpectedly huge artist
   // catalogs. A partial catalog is explicitly ineligible for Generational Run.
   for(let page=0;page<5;page++){
-    const data=await mbJson(`/release-group?artist=${artistMbid}&limit=100&offset=${offset}`);
+    const data=await mbJson(`/release-group/?artist=${artistMbid}&limit=100&offset=${offset}`);
     const groups=data?.['release-groups']||[]; total=Number(data?.['release-group-count']??groups.length); all.push(...groups); offset+=groups.length;
     if(offset>=total||groups.length<100) break;
     if(page===4) partial=true;
