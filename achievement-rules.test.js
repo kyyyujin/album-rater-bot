@@ -39,4 +39,33 @@ r=ev(r3,[initial,r1,r2,r3]); assert(has(r,'antifragile',1)&&has(r,'antifragile',
 const wrongAlbum=event('other','album_rescored',album('other',10),{previous_score:8,new_score:10,delta:2,occurred_at:'2026-02-15T00:00:00.000Z'}); assert(!has(ev(r1,[r1,wrongAlbum]),'antifragile'),'different albums never combine for ANTIFRAGILE');
 const review=event('review','review_written',album('talk',8),{substantial:true,excerpt:'A real review with enough words',occurred_at:'2026-01-01T00:00:00.000Z'}); const talk=event('talk','album_rescored',album('talk',8.8),{previous_score:8,new_score:8.8,delta:.8,occurred_at:'2026-02-02T00:00:00.000Z'}); assert(has(ev(talk,[review,talk]),'talk_that_talk'),'Talk That Talk requires eligible review before 30-day re-score');
 assert(substantialReview('This is a thoughtful review with actual words.',album('s',8)));assert(!substantialReview('Album s Artist s',album('s',8)));
-console.log('PASS start-from-zero, ratings, tracks, re-scores, ANTIFRAGILE and Talk That Talk');
+
+// Phase 1.5: only an already-resolved canonical release group can participate.
+const canonAlbum=(id,s)=>album(id,s);
+const canonEvents=[1,2,3,4].map(i=>event('canon-'+i,'album_rated',canonAlbum('c'+i,9.1),{occurred_at:'2026-09-13T12:0'+i+':00.000Z'}));
+const identities=Object.fromEntries([1,2,3,4].map(i=>['c'+i,{status:'resolved',release_group_id:'rg'+i}]));
+const artist={id:'artist-1',display_name:'TWICE',musicbrainz_artist_mbid:'11111111-1111-4111-8111-111111111111'};
+const groups=Object.fromEntries([1,2,3,4].map(i=>['rg'+i,{id:'rg'+i,artist_id:'artist-1',display_title:'Project '+i,musicbrainz_release_group_mbid:'00000000-0000-4000-8000-00000000000'+i,primary_type:'Album',first_release_date:'202'+i+'-01-01',artist}]));
+const discographies={'artist-1':{complete:true,release_group_ids:['rg1','rg2','rg3','rg4'],source:'musicbrainz_release_group_index'}};
+r=evaluate({event:canonEvents[3],eligibleEvents:canonEvents,canonicalIdentityByAlbumId:identities,releaseGroupsById:groups,artistDiscographies:discographies});
+assert(has(r,'artist_archivist',1),'three distinct canonical release groups unlock Artist Archivist I');
+assert(has(r,'icon'),'four distinct canonical release groups at S- unlock ICON');
+assert(has(r,'generational_run'),'three adjacent canonical main projects at S- unlock Generational Run');
+
+const duplicateIdentities=Object.fromEntries([1,2,3,4].map(i=>['c'+i,{status:'resolved',release_group_id:'rg1'}]));
+r=evaluate({event:canonEvents[3],eligibleEvents:canonEvents,canonicalIdentityByAlbumId:duplicateIdentities,releaseGroupsById:groups,artistDiscographies:discographies});
+assert(!has(r,'artist_archivist')&&!has(r,'icon')&&!has(r,'generational_run'),'four editions of one release group never count as four projects');
+
+const unresolved={...identities,c4:{status:'unresolved',release_group_id:null}};
+r=evaluate({event:canonEvents[3],eligibleEvents:canonEvents,canonicalIdentityByAlbumId:unresolved,releaseGroupsById:groups,artistDiscographies:discographies});
+assert(!has(r,'icon'),'unresolved releases never unlock identity achievements');
+
+const gappedDiscographies={'artist-1':{complete:true,release_group_ids:['rg1','other','rg2','rg3'],source:'musicbrainz_release_group_index'}};
+r=evaluate({event:canonEvents[3],eligibleEvents:canonEvents,canonicalIdentityByAlbumId:identities,releaseGroupsById:groups,artistDiscographies:gappedDiscographies});
+assert(!has(r,'generational_run'),'a known main project between rated groups breaks Generational Run');
+
+const uncertain={'artist-1':{complete:false,release_group_ids:['rg1','rg2','rg3'],source:'musicbrainz_release_group_index'}};
+r=evaluate({event:canonEvents[3],eligibleEvents:canonEvents,canonicalIdentityByAlbumId:identities,releaseGroupsById:groups,artistDiscographies:uncertain});
+assert(!has(r,'generational_run'),'an incomplete discography can never infer adjacency');
+
+console.log('PASS start-from-zero, ratings, tracks, re-scores, ANTIFRAGILE, Talk That Talk and Phase 1.5 canonical identity');
