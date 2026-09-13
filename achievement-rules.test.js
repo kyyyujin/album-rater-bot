@@ -16,12 +16,15 @@ assert(!has(r,'masterpiece'),'historic 10 does not unlock Masterpiece');
 assert.strictEqual(r.progress.find(p=>p.key==='archivist').currentValue,1,'Archivist begins at 1 after first new rating');
 
 const postTen=event('new-10','album_rated',album('ten',10)); assert(has(ev(postTen,[current,postTen]),'masterpiece'),'new 10 unlocks Masterpiece');
+const postLow=event('new-low','album_rated',album('low',3)); assert(has(ev(postLow,[current,postLow]),'savage'),'new score <= 3 unlocks Savage');
 const tenRatings=Array.from({length:10},(_,i)=>event(`post-${i}`,'album_rated',album(`p${i}`,8),{occurred_at:`2026-09-12T12:${String(i).padStart(2,'0')}:00.000Z`}));
 r=ev(tenRatings[9],tenRatings); assert(has(r,'archivist',1),'10 eligible ratings unlock Archivist I');
 
 const rescored=album('r',9); const firstRescore=event('rescore-1','album_rescored',rescored,{previous_score:8,new_score:9,delta:1});
 assert(has(ev(firstRescore,[firstRescore]),'second_thoughts'),'post-activation re-score unlocks Second Thoughts');
 assert(has(ev(firstRescore,[firstRescore]),'it_grew_on_me'),'positive delta unlocks It Grew On Me');
+const downRescore=event('rescore-down','album_rescored',album('r',7.8),{previous_score:9,new_score:7.8,delta:-1.2});
+assert(has(ev(downRescore,[downRescore]),'what_was_i_thinking'),'negative delta unlocks What Was I Thinking?');
 
 const no=album('no',9,{a:9,b:9,c:9,d:9,e:9,f:9}); assert(has(ev(event('tracks','track_scores_saved',no),[event('tracks','track_scores_saved',no)]),'no_skip'),'post action unlocks No Skip');
 const bal=album('bal',8,{a:8,b:8.1,c:8.2,d:8.1,e:8,f:8.2}); assert(has(ev(event('balanced','track_scores_saved',bal),[event('balanced','track_scores_saved',bal)]),'perfectly_balanced'),'post action unlocks Perfectly Balanced');
