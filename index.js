@@ -1066,7 +1066,7 @@ async function findStrictReleaseGroup(album) {
   const title=String(album?.title||'').trim(), artist=String(album?.artist||'').trim();
   if(!title||!artist) return {status:'unresolved',note:'missing_title_or_artist'};
   const query=`releasegroup:${JSON.stringify(title)} AND artist:${JSON.stringify(artist)}`;
-  const result=await mbJson(`/release-group/?query=${encodeURIComponent(query)}&limit=10`);
+  const result=await mbJson(`/release-group?query=${encodeURIComponent(query)}&limit=10`);
   const exact=(result?.['release-groups']||[]).filter(group=>{
     const credit=mbArtistCredit(group);
     return identityText(group.title)===identityText(title) && credit && identityText(credit.name)===identityText(artist);
@@ -1088,7 +1088,7 @@ async function ensureArtistDiscography(artistRow) {
   // A bounded pagination cap protects a worker from unexpectedly huge artist
   // catalogs. A partial catalog is explicitly ineligible for Generational Run.
   for(let page=0;page<5;page++){
-    const data=await mbJson(`/release-group/?artist=${artistMbid}&limit=100&offset=${offset}`);
+    const data=await mbJson(`/release-group?artist=${artistMbid}&limit=100&offset=${offset}`);
     const groups=data?.['release-groups']||[]; total=Number(data?.['release-group-count']??groups.length); all.push(...groups); offset+=groups.length;
     if(offset>=total||groups.length<100) break;
     if(page===4) partial=true;
