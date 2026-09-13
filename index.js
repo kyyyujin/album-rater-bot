@@ -326,6 +326,9 @@ function escapeHtmlAttribute(value) {
 // Verifica el compositor real que usa /render-rating. La promesa se comparte para
 // no abrir páginas nuevas en cada consulta mientras diagnosticamos el servicio.
 let ratingRendererHealthPromise = null;
+// Shared contract with Rater-Page. A split deploy must fail clearly instead of
+// silently producing a card with an older renderer.
+const RATING_EXPORT_REVISION = 'rater-export-20260913.1';
 app.get('/render-rating/health', async (_req, res) => {
   if (!ratingRendererHealthPromise) {
     ratingRendererHealthPromise = (async () => {
@@ -337,7 +340,7 @@ app.get('/render-rating/health', async (_req, res) => {
         await page.setContent('<main style="width:160px;height:90px;background:#123;color:#fff">ok</main>');
         const element = await page.$('main');
         const png = await element.screenshot({ type: 'png' });
-        return { ok: true, renderer: 'chromium', bytes: png.length };
+        return { ok: true, renderer: 'chromium', revision: RATING_EXPORT_REVISION, bytes: png.length };
       } finally {
         if (page) await page.close().catch(() => {});
       }
@@ -466,6 +469,7 @@ ${fontLinks}
     res.set('Cache-Control', 'no-store');
     res.set('X-Rating-Renderer', 'chromium');
     res.set('X-Rating-Image-Width', String(RATING_EXPORT_IMAGE_WIDTH));
+    res.set('X-Rating-Export-Revision', RATING_EXPORT_REVISION);
     res.send(png);
   } catch (error) {
     console.error('[render-rating]', error);
