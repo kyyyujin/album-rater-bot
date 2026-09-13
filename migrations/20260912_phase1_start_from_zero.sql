@@ -44,12 +44,26 @@ begin
   end if;
 end $$;
 
--- Install this only after the one-time correction: an unlock Memory Card is
--- archival data and no later process may rewrite or delete it.
+-- Install this only after the one-time correction. The Memory Card and the
+-- identity/timestamp of an unlock are archival data. Privacy flags may evolve
+-- later without ever rewriting the historical card itself.
 create or replace function public.prevent_achievement_unlock_mutation()
 returns trigger language plpgsql security definer set search_path = public as $$
 begin
-  raise exception 'Achievement unlocks and snapshots are immutable';
+  if tg_op = 'DELETE' then
+    raise exception 'Achievement unlocks cannot be deleted';
+  end if;
+  if new.user_id is distinct from old.user_id
+     or new.achievement_key is distinct from old.achievement_key
+     or new.level is distinct from old.level
+     or new.unlocked_at is distinct from old.unlocked_at
+     or new.source is distinct from old.source
+     or new.rule_version is distinct from old.rule_version
+     or new.snapshot is distinct from old.snapshot
+     or new.created_at is distinct from old.created_at then
+    raise exception 'Achievement unlock memory is immutable';
+  end if;
+  return new;
 end $$;
 drop trigger if exists vault_achievement_unlocks_immutable on public.vault_achievement_unlocks;
 create trigger vault_achievement_unlocks_immutable
