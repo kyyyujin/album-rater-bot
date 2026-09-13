@@ -330,7 +330,7 @@ function escapeHtmlAttribute(value) {
 // Shared contract with Rater-Page. A split deploy must fail clearly instead of
 // silently producing a card with an older renderer.
 const RATING_EXPORT_REVISION = 'rater-export-20260913.2';
-const MUSIC_IDENTITY_REVISION = 'phase15-musicbrainz-release-groups.4';
+const MUSIC_IDENTITY_REVISION = 'phase15-musicbrainz-release-groups.5';
 app.get('/render-rating/health', (_req, res) => {
   try {
     // executablePath validates that Puppeteer resolved the installed browser
@@ -1135,6 +1135,9 @@ async function resolveVaultAlbumIdentity(username, album) {
     await emitIdentityResolved(username,album,identity);
     return identity;
   } catch(error) {
+    if(error?.status===404) {
+      return upsertVaultIdentity(username,album,{status:'unresolved',source:'musicbrainz',match_confidence:null,release_mbid_evidence:releaseMbid,resolution_note:'musicbrainz_not_found',attempted_at:new Date().toISOString(),retry_after:new Date(Date.now()+14*86400000).toISOString()});
+    }
     const retryAfter=new Date(Date.now()+15*60*1000).toISOString();
     return upsertVaultIdentity(username,album,{status:'failed',source:'musicbrainz',match_confidence:null,release_mbid_evidence:releaseMbid,resolution_note:String(error.message||error).slice(0,300),attempted_at:new Date().toISOString(),retry_after:retryAfter});
   }
