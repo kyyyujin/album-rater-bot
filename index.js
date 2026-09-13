@@ -8,6 +8,10 @@ const { Client, GatewayIntentBits, REST, Routes, SlashCommandBuilder, EmbedBuild
 const AchievementRules = require('./achievement-rules');
 
 const app    = express();
+// Render's small instances are memory constrained. libvips must not retain a
+// cache or fan out workers while Chromium is also used by the export route.
+sharp.cache(false);
+sharp.concurrency(1);
 // Las imágenes de Discord se procesan en memoria; un límite explícito evita que
 // una subida anómala lleve el proceso de Render al límite antes de ser rechazada.
 const upload = multer({
@@ -267,7 +271,7 @@ const PFP_COOLDOWN_MS = 35 * 60 * 1000;
 app.use((req, res, next) => {
   res.header('Access-Control-Allow-Origin', '*');
   res.header('Access-Control-Allow-Headers', 'Content-Type');
-  res.header('Access-Control-Expose-Headers', 'X-Rating-Renderer, X-Rating-Image-Width');
+  res.header('Access-Control-Expose-Headers', 'X-Rating-Renderer, X-Rating-Image-Width, X-Rating-Export-Revision');
   res.header('Access-Control-Allow-Methods', 'POST, GET, OPTIONS');
   if (req.method === 'OPTIONS') return res.sendStatus(200);
   next();
@@ -275,29 +279,29 @@ app.use((req, res, next) => {
 
 // ── Pixel-faithful rating export ──
 // A real Chromium compositor paints the same DOM/CSS used by the visible preview.
-let ratingExportBrowserPromise = null;
+// Chromium is intentionally on-demand: retaining it after a render exhausted
+// the memory allowance of the Render instance.
+let ratingExportBusy = false;
 const ratingExportRateLimits = new Map();
 
-function getRatingExportBrowser() {
-  if (!ratingExportBrowserPromise) {
-    ratingExportBrowserPromise = puppeteer.launch({
-      headless: true,
-      args: [
-        '--no-sandbox',
-        '--disable-setuid-sandbox',
-        '--disable-dev-shm-usage',
-        '--disable-gpu-sandbox',
-        '--font-render-hinting=medium'
-      ]
-    }).then(browser => {
-      browser.on('disconnected', () => { ratingExportBrowserPromise = null; });
-      return browser;
-    }).catch(error => {
-      ratingExportBrowserPromise = null;
-      throw error;
-    });
-  }
-  return ratingExportBrowserPromise;
+function launchRatingExportBrowser() {
+  return puppeteer.launch({
+    headless: true,
+    args: [
+      '--no-sandbox',
+      '--disable-setuid-sandbox',
+      '--disable-dev-shm-usage',
+      '--disable-gpu',
+      '--no-zygote',
+      '--disable-extensions',
+      '--disable-background-networking',
+      '--disable-default-apps',
+      '--disable-sync',
+      '--metrics-recording-only',
+      '--mute-audio',
+      '--font-render-hinting=medium'
+    ]
+  });
 }
 
 function isPrivateRenderHost(hostname) {
@@ -323,39 +327,29 @@ function escapeHtmlAttribute(value) {
   return String(value).replace(/&/g, '&amp;').replace(/"/g, '&quot;');
 }
 
-// Verifica el compositor real que usa /render-rating. La promesa se comparte para
-// no abrir páginas nuevas en cada consulta mientras diagnosticamos el servicio.
-let ratingRendererHealthPromise = null;
 // Shared contract with Rater-Page. A split deploy must fail clearly instead of
 // silently producing a card with an older renderer.
-const RATING_EXPORT_REVISION = 'rater-export-20260913.1';
-app.get('/render-rating/health', async (_req, res) => {
-  if (!ratingRendererHealthPromise) {
-    ratingRendererHealthPromise = (async () => {
-      let page = null;
-      try {
-        const browser = await getRatingExportBrowser();
-        page = await browser.newPage();
-        await page.setViewport({ width: 320, height: 180, deviceScaleFactor: 1 });
-        await page.setContent('<main style="width:160px;height:90px;background:#123;color:#fff">ok</main>');
-        const element = await page.$('main');
-        const png = await element.screenshot({ type: 'png' });
-        return { ok: true, renderer: 'chromium', revision: RATING_EXPORT_REVISION, bytes: png.length };
-      } finally {
-        if (page) await page.close().catch(() => {});
-      }
-    })().catch(error => {
-      ratingRendererHealthPromise = null;
-      return {
-        ok: false,
-        renderer: 'chromium',
-        error: String(error && error.message ? error.message : error).slice(0, 800)
-      };
+const RATING_EXPORT_REVISION = 'rater-export-20260913.2';
+app.get('/render-rating/health', (_req, res) => {
+  try {
+    // executablePath validates that Puppeteer resolved the installed browser
+    // without launching a resident Chromium process just for a health check.
+    const executablePath = puppeteer.executablePath();
+    res.json({
+      ok: Boolean(executablePath),
+      renderer: 'chromium',
+      revision: RATING_EXPORT_REVISION,
+      mode: 'on-demand',
+      busy: ratingExportBusy
+    });
+  } catch (error) {
+    res.status(503).json({
+      ok: false,
+      renderer: 'chromium',
+      revision: RATING_EXPORT_REVISION,
+      error: String(error && error.message ? error.message : error).slice(0, 800)
     });
   }
-
-  const result = await ratingRendererHealthPromise;
-  res.status(result.ok ? 200 : 503).json(result);
 });
 
 // The master rating export is intentionally desktop-only. A phone can request
@@ -374,6 +368,13 @@ app.post('/render-rating', express.json({ limit: '3mb' }), async (req, res) => {
   recent.push(now);
   ratingExportRateLimits.set(ip, recent);
 
+  if (ratingExportBusy) {
+    res.set('Retry-After', '8');
+    return res.status(503).json({ error: 'El renderer está terminando otra exportación. Intenta nuevamente en unos segundos.' });
+  }
+  ratingExportBusy = true;
+
+  let browser = null;
   let page = null;
   try {
     const { token, cardHtml, cssText, fontUrls } = req.body || {};
@@ -398,7 +399,7 @@ app.post('/render-rating', express.json({ limit: '3mb' }), async (req, res) => {
       ? fontUrls.filter(url => /^https:\/\/fonts\.googleapis\.com\//i.test(String(url))).slice(0, 4)
       : [];
 
-    const browser = await getRatingExportBrowser();
+    browser = await launchRatingExportBrowser();
     page = await browser.newPage();
     await page.setViewport({
       width: safeViewportWidth,
@@ -455,15 +456,27 @@ ${fontLinks}
       throw new Error('Dimensiones de preview inválidas');
     }
 
-    const chromiumPng = await card.screenshot({
+    let png = Buffer.from(await card.screenshot({
       type: 'png',
       omitBackground: true,
       captureBeyondViewport: true
-    });
-    const png = await sharp(chromiumPng)
-      .resize({ width: RATING_EXPORT_IMAGE_WIDTH, withoutEnlargement: false })
-      .png({ compressionLevel: 9 })
-      .toBuffer();
+    }));
+
+    // Free Chromium before any optional PNG recompression and before the
+    // client uploads the image back through /post. This is the critical peak-
+    // memory boundary on Render.
+    await page.close();
+    page = null;
+    await browser.close();
+    browser = null;
+
+    // Chrome already paints 1280 CSS px at 1.5 DPR = 1920 output px. Only
+    // recompress unusually large files, after Chromium has been released.
+    if (png.length > 7 * 1024 * 1024) {
+      png = await sharp(png)
+        .png({ compressionLevel: 9, adaptiveFiltering: true })
+        .toBuffer();
+    }
 
     res.set('Content-Type', 'image/png');
     res.set('Cache-Control', 'no-store');
@@ -476,6 +489,12 @@ ${fontLinks}
     res.status(500).json({ error: 'No se pudo renderizar la exportación con Chromium' });
   } finally {
     if (page) await page.close().catch(() => {});
+    if (browser) {
+      await browser.close().catch(() => {
+        try { browser.process()?.kill('SIGKILL'); } catch (_) {}
+      });
+    }
+    ratingExportBusy = false;
   }
 });
 
@@ -569,7 +588,6 @@ app.post('/delete', express.json(), async (req, res) => {
 app.post('/save', upload.single('file'), async (req, res) => {
   try {
     const { title, user_id, artist, cover_url, cover_score, tracks, final_score, final_rank, notes } = req.body;
-    if (!req.file)  return res.status(400).json({ error: 'No image provided' });
     if (!title)     return res.status(400).json({ error: 'No title provided' });
     if (!user_id)   return res.status(400).json({ error: 'No user_id provided' });
 
