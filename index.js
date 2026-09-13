@@ -1164,6 +1164,12 @@ function scheduleIdentityResolution(username) {
   const tick=async()=>{ try { const result=await runIdentityResolutionBatch(username,3); if(result.hasReady) return setTimeout(tick,1400); } catch(error) { console.error('[music identity job]',error.message); } finally { /* a scheduled continuation keeps the lock */ } identityResolverRuns.delete(username); };
   setTimeout(tick,80);
 }
+async function schedulePrivateIdentityBackfill() {
+  // Keep the beta owner case-safe: the existing app identity is not normalized
+  // in the users table, while the beta check intentionally is.
+  const rows=await sb('users?username=ilike.kyujin&select=username&limit=1');
+  if(rows?.[0]?.username) scheduleIdentityResolution(rows[0].username);
+}
 async function getCanonicalAchievementContext(username, eligibleEvents) {
   const albumIds=new Set((eligibleEvents||[]).map(e=>String(e?.payload?.album_id||AchievementRules.albumId(e?.payload?.album))).filter(Boolean));
   if(!albumIds.size) return {canonicalIdentityByAlbumId:{},releaseGroupsById:{},artistDiscographies:{}};
@@ -1895,6 +1901,9 @@ app.listen(PORT, () => {
   console.log(`Server running on port ${PORT}`);
   // Corre después de que Render marque el proceso como disponible.
   setTimeout(() => { runVaultCoverQualityMigration(); }, 3000);
+  // Phase 1.5 backfill is bounded, persisted and restartable. It resolves
+  // identity only; historical Vault facts remain ineligible for achievements.
+  setTimeout(() => { schedulePrivateIdentityBackfill().catch(error => console.error('[music identity startup]',error.message)); }, 10000);
 });
 
       
