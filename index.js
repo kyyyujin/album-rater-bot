@@ -993,7 +993,7 @@ async function processAchievementEvent(username, eventId) {
     const definition=AchievementRules.DEFINITIONS.find(d=>d.key===c.key); if(!definition) continue;
     const snapshot={ ...c.snapshot, source:event.source, occurred_at:event.occurred_at, rule_version:definition.ruleVersion };
     const inserted=await sb('vault_achievement_unlocks?on_conflict=user_id,achievement_key,level',{method:'POST',headers:{Prefer:'resolution=ignore-duplicates,return=representation'},body:JSON.stringify({user_id:username,achievement_key:c.key,level:c.level,unlocked_at:new Date().toISOString(),source:event.source,rule_version:definition.ruleVersion,snapshot})});
-    if(Array.isArray(inserted)&&inserted[0]) { unlocks.push(inserted[0]); if (event.source !== 'baseline_activation') await sb('vault_achievement_inbox',{method:'POST',headers:{Prefer:'return=minimal'},body:JSON.stringify({user_id:username,unlock_id:inserted[0].id,source:event.source})}); }
+    if(Array.isArray(inserted)&&inserted[0]) { unlocks.push(inserted[0]); await sb('vault_achievement_inbox',{method:'POST',headers:{Prefer:'return=minimal'},body:JSON.stringify({user_id:username,unlock_id:inserted[0].id,source:event.source})}); }
   }
   await refreshRatingRecords(username, eligibleEvents);
   await sb(`vault_achievement_events?event_id=eq.${eventId}`,{method:'PATCH',headers:{Prefer:'return=minimal'},body:JSON.stringify({processed_at:new Date().toISOString(),unlock_ids:unlocks.map(u=>u.id)})});
