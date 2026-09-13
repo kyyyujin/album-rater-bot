@@ -330,7 +330,7 @@ function escapeHtmlAttribute(value) {
 // Shared contract with Rater-Page. A split deploy must fail clearly instead of
 // silently producing a card with an older renderer.
 const RATING_EXPORT_REVISION = 'rater-export-20260913.2';
-const MUSIC_IDENTITY_REVISION = 'phase15-musicbrainz-release-groups.5';
+const MUSIC_IDENTITY_REVISION = 'phase15-musicbrainz-release-groups.6';
 app.get('/render-rating/health', (_req, res) => {
   try {
     // executablePath validates that Puppeteer resolved the installed browser
@@ -1160,7 +1160,8 @@ async function runIdentityResolutionBatch(username, limit=3) {
   const latest=await sb(`vault_album_identities?user_id=eq.${encodeURIComponent(username)}&select=album_id,status,retry_after`);
   const latestById=new Map((latest||[]).map(x=>[String(x.album_id),x]));
   const hasReady=albums.some(album=>{ const row=latestById.get(String(album.id)); return !row || (row.status!=='resolved'&&(!row.retry_after||Date.parse(row.retry_after)<=Date.now())); });
-  await sb(`vault_music_identity_jobs?user_id=eq.${encodeURIComponent(username)}`,{method:'PATCH',headers:{Prefer:'return=minimal'},body:JSON.stringify({status:hasReady?'queued':'complete',completed_at:hasReady?null:new Date().toISOString(),resolved_count:stats.resolved,unresolved_count:stats.unresolved,ambiguous_count:stats.ambiguous,edition_duplicates_count:stats.editionDuplicates,metadata:{total_albums:albums.length,links:stats.total},updated_at:new Date().toISOString()})});
+  const jobStatus=hasReady?'queued':(stats.failed?'partial':'complete');
+  await sb(`vault_music_identity_jobs?user_id=eq.${encodeURIComponent(username)}`,{method:'PATCH',headers:{Prefer:'return=minimal'},body:JSON.stringify({status:jobStatus,completed_at:hasReady?null:new Date().toISOString(),resolved_count:stats.resolved,unresolved_count:stats.unresolved,ambiguous_count:stats.ambiguous,edition_duplicates_count:stats.editionDuplicates,metadata:{total_albums:albums.length,links:stats.total},updated_at:new Date().toISOString()})});
   return {hasReady,stats,processed:work.length};
 }
 function scheduleIdentityResolution(username) {
