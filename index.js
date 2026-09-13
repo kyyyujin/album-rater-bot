@@ -948,38 +948,54 @@ async function getAchievementEvents(username, albumId = null) {
   const rows = await sb(q);
   return albumId ? rows.filter(e => String(e.payload?.album_id || '') === String(albumId)) : rows;
 }
-async function writeProgress(username, candidates) {
-  const max = new Map(); candidates.forEach(c => { const old=max.get(c.key); if (!old || c.level > old.level) max.set(c.key,c); });
-  const rows = [...max.values()].map(c => ({ user_id:username, achievement_key:c.key, current_level:c.level, current_value:c.currentValue ?? null, target_value:c.targetValue ?? null, evaluated_at:new Date().toISOString() }));
+async function getAchievementState(username) {
+  const rows = await sb(`vault_achievement_state?user_id=eq.${encodeURIComponent(username)}&select=user_id,achievement_tracking_started_at&limit=1`);
+  return rows?.[0] || null;
+}
+async function ensureAchievementTracking(username) {
+  const current = await getAchievementState(username); if (current?.achievement_tracking_started_at) return current;
+  const startedAt = new Date().toISOString();
+  // First activation is an irreversible cutoff.  Ignore a concurrent insert
+  // instead of merging it: merging could move the cutoff forward and reject a
+  // legitimate first event that was accepted by the other request.
+  await sb('vault_achievement_state?on_conflict=user_id', { method:'POST', headers:{Prefer:'resolution=ignore-duplicates,return=minimal'}, body:JSON.stringify({user_id:username,achievement_tracking_started_at:startedAt,last_evaluated_at:startedAt}) });
+  return (await getAchievementState(username)) || { user_id:username, achievement_tracking_started_at:startedAt };
+}
+async function writeProgress(username, progress) {
+  const rows = (progress || []).map(p => ({ user_id:username, achievement_key:p.key, current_level:p.currentLevel ?? 0, current_value:p.currentValue ?? null, target_value:p.targetValue ?? null, evaluated_at:new Date().toISOString() }));
   if (rows.length) await sb('vault_achievement_progress?on_conflict=user_id,achievement_key', { method:'POST', headers:{ Prefer:'resolution=merge-duplicates,return=minimal' }, body:JSON.stringify(rows) });
 }
-async function refreshRatingRecords(username, collection) {
+async function refreshRatingRecords(username, eligibleEvents) {
   const records=[];
-  for (const album of (collection?.albums || [])) {
-    const h=(album.scoreHistory || []).map(x=>AchievementRules.score(x?.score)).filter(x=>x!==null);
-    for(let i=1;i<h.length;i++) { const d=AchievementRules.score(h[i]-h[i-1]);
-      if(d>0) records.push({kind:'biggest_rating_comeback',delta:d,album});
-      if(d<0) records.push({kind:'biggest_rating_drop',delta:Math.abs(d),album});
-    }
+  for (const event of eligibleEvents || []) {
+    if (event.type !== 'album_rescored') continue;
+    const d=AchievementRules.score(event.payload?.delta), album=event.payload?.album;
+    if(d>0) records.push({kind:'biggest_rating_comeback',delta:d,album});
+    if(d<0) records.push({kind:'biggest_rating_drop',delta:Math.abs(d),album});
   }
   const rows=[];
   for (const kind of ['biggest_rating_comeback','biggest_rating_drop']) { const r=records.filter(x=>x.kind===kind).sort((a,b)=>b.delta-a.delta)[0]; if(r) rows.push({user_id:username,record_key:kind,value:{delta:r.delta,album:AchievementRules.brief(r.album)},observed_at:new Date().toISOString(),updated_at:new Date().toISOString()}); }
   if(rows.length) await sb('vault_personal_records?on_conflict=user_id,record_key',{method:'POST',headers:{Prefer:'resolution=merge-duplicates,return=minimal'},body:JSON.stringify(rows)});
 }
 async function processAchievementEvent(username, eventId) {
+  const state = await ensureAchievementTracking(username);
   const events = await getAchievementEvents(username);
   const event = events.find(e=>e.event_id===eventId); if (!event || event.processed_at) return [];
-  const collection = await getVaultCollection(username) || { albums:[] };
-  const candidates = AchievementRules.evaluate({ collection, event, priorEvents:events.filter(e=>e.event_id!==eventId) });
-  await writeProgress(username, candidates);
+  const eligibleEvents = AchievementRules.eligibleAfter(events, state.achievement_tracking_started_at);
+  if (!eligibleEvents.some(e=>e.event_id===eventId)) {
+    await sb(`vault_achievement_events?event_id=eq.${eventId}`,{method:'PATCH',headers:{Prefer:'return=minimal'},body:JSON.stringify({processed_at:new Date().toISOString(),processing_error:'before_tracking_started'})});
+    return [];
+  }
+  const evaluation = AchievementRules.evaluate({ event, eligibleEvents });
+  await writeProgress(username, evaluation.progress);
   const unlocks=[];
-  for (const c of candidates) {
+  for (const c of evaluation.candidates) {
     const definition=AchievementRules.DEFINITIONS.find(d=>d.key===c.key); if(!definition) continue;
     const snapshot={ ...c.snapshot, source:event.source, occurred_at:event.occurred_at, rule_version:definition.ruleVersion };
     const inserted=await sb('vault_achievement_unlocks?on_conflict=user_id,achievement_key,level',{method:'POST',headers:{Prefer:'resolution=ignore-duplicates,return=representation'},body:JSON.stringify({user_id:username,achievement_key:c.key,level:c.level,unlocked_at:new Date().toISOString(),source:event.source,rule_version:definition.ruleVersion,snapshot})});
     if(Array.isArray(inserted)&&inserted[0]) { unlocks.push(inserted[0]); if (event.source !== 'baseline_activation') await sb('vault_achievement_inbox',{method:'POST',headers:{Prefer:'return=minimal'},body:JSON.stringify({user_id:username,unlock_id:inserted[0].id,source:event.source})}); }
   }
-  await refreshRatingRecords(username, collection);
+  await refreshRatingRecords(username, eligibleEvents);
   await sb(`vault_achievement_events?event_id=eq.${eventId}`,{method:'PATCH',headers:{Prefer:'return=minimal'},body:JSON.stringify({processed_at:new Date().toISOString(),unlock_ids:unlocks.map(u=>u.id)})});
   return unlocks;
 }
@@ -992,9 +1008,9 @@ async function achievementReadModel(username) {
     sb('vault_achievement_definitions?enabled=eq.true&order=key.asc'), sb(`vault_achievement_progress?user_id=eq.${encodeURIComponent(username)}`),
     sb(`vault_achievement_unlocks?user_id=eq.${encodeURIComponent(username)}&select=id,achievement_key,level,unlocked_at,source,public_visible&order=unlocked_at.desc`),
     sb(`vault_achievement_showcase?user_id=eq.${encodeURIComponent(username)}&order=position.asc`), sb(`vault_personal_records?user_id=eq.${encodeURIComponent(username)}`),
-    sb(`vault_achievement_inbox?user_id=eq.${encodeURIComponent(username)}&delivered_at=is.null&order=created_at.asc`), sb(`vault_achievement_state?user_id=eq.${encodeURIComponent(username)}&limit=1`)
+    sb(`vault_achievement_inbox?user_id=eq.${encodeURIComponent(username)}&delivered_at=is.null&order=created_at.asc`), sb(`vault_achievement_state?user_id=eq.${encodeURIComponent(username)}&select=achievement_tracking_started_at&limit=1`)
   ]);
-  return { definitions:defs, progress, unlocks, showcase, records, inbox, baselineActivated:!!state?.[0]?.baseline_activated_at, availableCount:defs.length, unlockedFamilies:new Set(unlocks.map(u=>u.achievement_key)).size };
+  return { definitions:defs, progress, unlocks, showcase, records, inbox, trackingStartedAt:state?.[0]?.achievement_tracking_started_at || null, availableCount:defs.length, unlockedFamilies:new Set(unlocks.map(u=>u.achievement_key)).size };
 }
 
 // ── Migración única de portadas de Vault ──
@@ -1259,6 +1275,7 @@ app.post('/vault-collection/events', express.json({ limit: '2mb' }), async (req,
     if (!isAchievementBetaUser(username)) { await saveVaultCollection(username, collection ?? null); return res.json({ ok:true, beta:false }); }
     if (!Array.isArray(events) || !events.length || events.length > 30) return res.status(400).json({ error: 'Eventos inválidos' });
     await ensureAchievementDefinitions();
+    await ensureAchievementTracking(username);
     const permitted = new Set(['album_rated','album_added','review_written','review_updated','album_rescored','track_scores_saved']);
     for (const event of events) {
       if (!permitted.has(event?.type) || !event?.idempotency_key || !event?.payload || String(event.idempotency_key).length > 240) return res.status(400).json({ error:'Evento incompleto' });
@@ -1282,14 +1299,8 @@ app.post('/achievements/activate', express.json(), async (req,res) => {
     const username=await verifyToken(req.body?.token); if(!username) return res.status(401).json({error:'Sesión inválida o expirada'});
     if (!isAchievementBetaUser(username)) return res.json({ok:true,beta:false});
     await ensureAchievementDefinitions();
-    const existing=await sb(`vault_achievement_state?user_id=eq.${encodeURIComponent(username)}&select=baseline_activated_at&limit=1`);
-    if (!existing?.[0]?.baseline_activated_at) {
-      const collection=await getVaultCollection(username) || {albums:[]};
-      const event={ event_id:crypto.randomUUID(), occurred_at:new Date().toISOString(), type:'collection_baselined', payload_version:1, source:'baseline_activation', idempotency_key:'phase1-baseline-v1', payload:{ baseline_version:1 } };
-      const saved=await saveCollectionWithAchievementEvents(username,collection,[event]);
-      await processAchievementEvents(username,saved.map(x=>x.event_id));
-      await sb('vault_achievement_state?on_conflict=user_id',{method:'POST',headers:{Prefer:'resolution=merge-duplicates,return=minimal'},body:JSON.stringify({user_id:username,baseline_activated_at:new Date().toISOString(),baseline_version:1,last_evaluated_at:new Date().toISOString()})});
-    }
+    // Activation is intentionally empty: historical Vault data is not a baseline.
+    await ensureAchievementTracking(username);
     res.json({ok:true, ...(await achievementReadModel(username))});
   } catch(err) { console.error('[achievement baseline]',err.message); res.status(500).json({error:'No se pudo activar Achievement Vault'}); }
 });
