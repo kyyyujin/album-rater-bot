@@ -330,7 +330,7 @@ function escapeHtmlAttribute(value) {
 // Shared contract with Rater-Page. A split deploy must fail clearly instead of
 // silently producing a card with an older renderer.
 const RATING_EXPORT_REVISION = 'rater-export-20260913.2';
-const MUSIC_IDENTITY_REVISION = 'phase15-musicbrainz-release-groups.2';
+const MUSIC_IDENTITY_REVISION = 'phase15-musicbrainz-release-groups.3';
 app.get('/render-rating/health', (_req, res) => {
   try {
     // executablePath validates that Puppeteer resolved the installed browser
