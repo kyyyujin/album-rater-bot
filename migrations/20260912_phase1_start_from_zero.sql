@@ -48,7 +48,7 @@ end $$;
 -- identity/timestamp of an unlock are archival data. Privacy flags may evolve
 -- later without ever rewriting the historical card itself.
 create or replace function public.prevent_achievement_unlock_mutation()
-returns trigger language plpgsql security definer set search_path = public as $$
+returns trigger language plpgsql security invoker set search_path = public as $$
 begin
   if tg_op = 'DELETE' then
     raise exception 'Achievement unlocks cannot be deleted';
@@ -73,7 +73,7 @@ for each row execute function public.prevent_achievement_unlock_mutation();
 -- A running legacy server must never recreate a historical baseline during a
 -- rolling deploy. New Phase 1 code does not emit either of these values.
 create or replace function public.reject_legacy_achievement_baseline()
-returns trigger language plpgsql security definer set search_path = public as $$
+returns trigger language plpgsql security invoker set search_path = public as $$
 begin
   if new.source = 'baseline_activation' or new.type = 'collection_baselined' then
     raise exception 'Historical achievement baselines are disabled; tracking starts at activation';
@@ -84,3 +84,9 @@ drop trigger if exists vault_achievement_events_reject_legacy_baseline on public
 create trigger vault_achievement_events_reject_legacy_baseline
 before insert on public.vault_achievement_events
 for each row execute function public.reject_legacy_achievement_baseline();
+
+-- Trigger functions are internal implementation details, never RPC endpoints.
+revoke all on function public.prevent_achievement_unlock_mutation() from public, anon, authenticated;
+revoke all on function public.reject_legacy_achievement_baseline() from public, anon, authenticated;
+grant execute on function public.prevent_achievement_unlock_mutation() to service_role;
+grant execute on function public.reject_legacy_achievement_baseline() to service_role;
