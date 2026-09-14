@@ -20,4 +20,15 @@ assert(delayed>=watermark-overlap,'delayed scrobble is in overlap');
 // Coverage gaps are not zero: only explicit covered windows contribute.
 const coverage=(windows,a,b)=>windows.filter(w=>w.status==='covered').reduce((sum,w)=>sum+Math.max(0,Math.min(b,w.end)-Math.max(a,w.start)),0)/(b-a);
 assert.equal(coverage([{status:'covered',start:0,end:50},{status:'coverage_gap',start:50,end:100}],0,100),.5,'gap cannot prove absence');
-console.log('PASS zero-start, deterministic dedupe, delayed overlap and coverage-gap semantics');
+// Bounded runs keep their prior watermark when pagination did not bridge the
+// gap; the persisted backlog cursor supplies the next job's continuation.
+const plan=(before,{reached,oldest,latest})=>({watermark:reached?Math.max(before,latest):before,backlog:reached?null:oldest});
+assert.deepEqual(plan(100,{reached:false,oldest:180,latest:300}),{watermark:100,backlog:180},'backlog never advances watermark');
+assert.deepEqual(plan(100,{reached:true,oldest:90,latest:300}),{watermark:300,backlog:null},'reconciled range advances watermark');
+// Username changes create a new epoch.  The new account begins at its own
+// server activation point and cannot contribute earlier plays to the old one.
+const epochA={number:1,username:'a',started:100,closed:true};
+const epochB={number:2,username:'b',started:500,closed:false};
+assert(epochA.closed&&epochB.started>epochA.started&&epochB.username!=='a','account change preserves epochs');
+assert.equal([450,500,501].filter(ts=>ts>=epochB.started).length,2,'new username does not backfill');
+console.log('PASS zero-start, deterministic dedupe, delayed overlap, coverage gaps, bounded watermark and account epochs');
