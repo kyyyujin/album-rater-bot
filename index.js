@@ -6,6 +6,7 @@ const sharp     = require('sharp');
 const puppeteer = require('puppeteer');
 const { Client, GatewayIntentBits, REST, Routes, SlashCommandBuilder, EmbedBuilder } = require('discord.js');
 const AchievementRules = require('./achievement-rules');
+const ListeningRules = require('./listening-rules');
 
 const app    = express();
 // Render's small instances are memory constrained. libvips must not retain a
@@ -23,6 +24,14 @@ const BOT_TOKEN    = process.env.BOT_TOKEN;
 const CLIENT_ID    = process.env.CLIENT_ID;
 const SUPABASE_URL = process.env.SUPABASE_URL;
 const SUPABASE_KEY = process.env.SUPABASE_KEY;
+// The legacy browser integration already uses this public Last.fm application
+// key. Phase 2 keeps all ledger requests server-side and prefers an env key so
+// it can be rotated without a client release.
+const LASTFM_API_KEY = process.env.LASTFM_API_KEY || '194ec400973f470ddaccd3248100186f';
+const LASTFM_API_BASE = 'https://ws.audioscrobbler.com/2.0/';
+const LASTFM_OVERLAP_MS = 10 * 60 * 1000;
+const LASTFM_MAX_PAGES_PER_SYNC = 5;
+const LASTFM_PAGE_SIZE = 200;
 
 // ── Discord OAuth (login web, distinto del bot de gateway) ──
 // CLIENT_ID se reutiliza (es la misma app de Discord que ya tenés).
@@ -331,6 +340,7 @@ function escapeHtmlAttribute(value) {
 // silently producing a card with an older renderer.
 const RATING_EXPORT_REVISION = 'rater-export-20260913.2';
 const MUSIC_IDENTITY_REVISION = 'phase15-musicbrainz-release-groups.6';
+const LISTENING_LEDGER_REVISION = 'phase2-lastfm-ledger.1';
 app.get('/render-rating/health', (_req, res) => {
   try {
     // executablePath validates that Puppeteer resolved the installed browser
@@ -341,6 +351,7 @@ app.get('/render-rating/health', (_req, res) => {
       renderer: 'chromium',
       revision: RATING_EXPORT_REVISION,
       music_identity_revision: MUSIC_IDENTITY_REVISION,
+      listening_ledger_revision: LISTENING_LEDGER_REVISION,
       mode: 'on-demand',
       busy: ratingExportBusy
     });
@@ -959,7 +970,7 @@ async function sb(path, options = {}) {
 let achievementDefinitionsReady = false;
 async function ensureAchievementDefinitions() {
   if (achievementDefinitionsReady) return;
-  const rows = AchievementRules.DEFINITIONS.map(d => ({ key:d.key,title:d.title,category:d.category,rarity:d.rarity,max_level:d.maxLevel,rule_version:d.ruleVersion,enabled:true,client_metadata:{ badge:d.key, ...(d.metadata || {}) } }));
+  const rows = AchievementRules.DEFINITIONS.map(d => ({ key:d.key,title:d.title,category:d.category,rarity:d.rarity,max_level:d.maxLevel,rule_version:d.ruleVersion,enabled:d.enabled!==false,client_metadata:{ badge:d.key, ...(d.metadata || {}) } }));
   await sb('vault_achievement_definitions?on_conflict=key', { method:'POST', headers:{ Prefer:'resolution=merge-duplicates,return=minimal' }, body:JSON.stringify(rows) });
   achievementDefinitionsReady = true;
 }
@@ -992,6 +1003,23 @@ async function writeProgress(username, progress) {
 async function writeArtistAchievementProgress(username, progress) {
   const rows=(progress||[]).filter(p=>p.artistId).map(p=>({user_id:username,achievement_key:p.key,artist_id:p.artistId,current_level:p.currentLevel??0,current_value:p.currentValue??null,target_value:p.targetValue??null,evaluated_at:new Date().toISOString()}));
   if(rows.length) await sb('vault_artist_achievement_progress?on_conflict=user_id,achievement_key,artist_id',{method:'POST',headers:{Prefer:'resolution=merge-duplicates,return=minimal'},body:JSON.stringify(rows)});
+}
+async function persistAchievementCandidates(username, candidates, source, occurredAt) {
+  await ensureAchievementDefinitions();
+  const unlocks=[];
+  for (const c of candidates || []) {
+    const definition=AchievementRules.DEFINITIONS.find(d=>d.key===c.key && d.enabled!==false); if(!definition) continue;
+    const levelRarity=definition.metadata?.levelRarities?.[c.level-1] || definition.rarity;
+    // This object is the immutable Memory Card. Later profile, cover, rating or
+    // canonical-metadata edits never patch an existing unlock snapshot.
+    const snapshot={ ...c.snapshot, level_rarity:levelRarity, source, occurred_at:occurredAt, rule_version:definition.ruleVersion };
+    const inserted=await sb('vault_achievement_unlocks?on_conflict=user_id,achievement_key,level',{method:'POST',headers:{Prefer:'resolution=ignore-duplicates,return=representation'},body:JSON.stringify({user_id:username,achievement_key:c.key,level:c.level,unlocked_at:new Date().toISOString(),source,rule_version:definition.ruleVersion,snapshot})});
+    if(Array.isArray(inserted)&&inserted[0]) {
+      unlocks.push(inserted[0]);
+      await sb('vault_achievement_inbox',{method:'POST',headers:{Prefer:'resolution=ignore-duplicates,return=minimal'},body:JSON.stringify({user_id:username,unlock_id:inserted[0].id,source})});
+    }
+  }
+  return unlocks;
 }
 async function refreshRatingRecords(username, eligibleEvents) {
   const records=[];
@@ -1176,6 +1204,186 @@ async function schedulePrivateIdentityBackfill() {
   const rows=await sb('users?username=ilike.kyujin&select=username&limit=1');
   if(rows?.[0]?.username) scheduleIdentityResolution(rows[0].username);
 }
+
+// ── Phase 2: Last.fm persistent listening ledger ──────────────────────────
+// Existing browser polling remains only a visual "Now Listening" feature.  The
+// following worker is the sole writer of tracked scrobbles and achievements.
+function normalizedLastfmUsername(value) { return String(value||'').trim().toLowerCase(); }
+function validIanaTimezone(value) { try { Intl.DateTimeFormat('en-US',{timeZone:value||'UTC'}); return value||'UTC'; } catch (_) { return 'UTC'; } }
+function localListeningParts(playedAt, timezone) {
+  const parts=new Intl.DateTimeFormat('en-CA',{timeZone:validIanaTimezone(timezone),year:'numeric',month:'2-digit',day:'2-digit',hour:'2-digit',hourCycle:'h23'}).formatToParts(new Date(playedAt));
+  const out=Object.fromEntries(parts.filter(x=>x.type!=='literal').map(x=>[x.type,x.value]));
+  return {local_date:`${out.year}-${out.month}-${out.day}`,local_hour:Number(out.hour)};
+}
+function sha256(value) { return crypto.createHash('sha256').update(value).digest('hex'); }
+function lastfmTrackText(track, field) { const value=track?.[field]; return String(value?.['#text'] || value?.name || value || '').trim(); }
+function confirmedLastfmTrack(track) { return Boolean(track?.date?.uts) && !track?.['@attr']?.nowplaying; }
+function lastfmFingerprint(epochId, track) {
+  const uts=String(track?.date?.uts||'');
+  return sha256([epochId,uts,AchievementRules.normText(lastfmTrackText(track,'artist')),AchievementRules.normText(lastfmTrackText(track,'name')),AchievementRules.normText(lastfmTrackText(track,'album')),safeMbId(track?.artist?.mbid)||'',safeMbId(track?.album?.mbid)||'',safeMbId(track?.mbid)||''].join('|'));
+}
+async function lastfmApi(params) {
+  const url=`${LASTFM_API_BASE}?${new URLSearchParams({...params,api_key:LASTFM_API_KEY,format:'json'}).toString()}`;
+  const res=await fetch(url,{headers:{Accept:'application/json','User-Agent':'AlbumVault/2.0 (listening ledger)'}});
+  const data=await res.json().catch(()=>({}));
+  if(!res.ok || data?.error) { const error=new Error(data?.message||`Last.fm ${res.status}`); error.status=res.status; error.code=data?.error||null; throw error; }
+  return data;
+}
+async function validateLastfmUsername(username) {
+  const data=await lastfmApi({method:'user.getinfo',user:username});
+  return Boolean(data?.user?.name);
+}
+async function getActiveLastfmEpoch(username) {
+  const rows=await sb(`lastfm_tracking_epochs?user_id=eq.${encodeURIComponent(username)}&status=eq.active&select=*&limit=1`);
+  return rows?.[0] || null;
+}
+async function activateLastfmTracking(username, profile) {
+  const configured=String(profile?.lastfmUsername||'').trim();
+  const active=await getActiveLastfmEpoch(username);
+  if(!configured) { if(active) await sb('rpc/lastfm_pause_active_epoch',{method:'POST',body:JSON.stringify({p_user_id:username,p_reason:'username_removed'})}); return null; }
+  if(active && active.normalized_username===normalizedLastfmUsername(configured)) return active;
+  await validateLastfmUsername(configured);
+  const timezone=validIanaTimezone(profile?.timezone || 'UTC');
+  const rows=await sb('rpc/lastfm_activate_epoch',{method:'POST',body:JSON.stringify({p_user_id:username,p_username:configured,p_timezone:timezone})});
+  return rows?.[0] || null;
+}
+async function syncRunPatch(runId, patch) { if(runId) await sb(`listening_sync_runs?id=eq.${runId}`,{method:'PATCH',headers:{Prefer:'return=minimal'},body:JSON.stringify(patch)}); }
+async function startListeningSyncRun(epoch) {
+  const rows=await sb('listening_sync_runs',{method:'POST',headers:{Prefer:'return=representation'},body:JSON.stringify({epoch_id:epoch.id,user_id:epoch.user_id,status:'running',watermark_before:epoch.watermark_played_at})});
+  return rows?.[0]?.id || null;
+}
+async function canonicalListeningIndex() {
+  const [artists,groups]=await Promise.all([
+    sb('music_artists?select=id,display_name,normalized_name,musicbrainz_artist_mbid&limit=5000'),
+    sb('music_release_groups?select=id,artist_id,display_title,normalized_title,musicbrainz_release_group_mbid&limit=5000')
+  ]);
+  const artistByMbid=new Map(), artistsByName=new Map(), groupByMbid=new Map(), groupsByArtistTitle=new Map();
+  for(const artist of artists||[]) { artistByMbid.set(String(artist.musicbrainz_artist_mbid),artist); const key=artist.normalized_name; if(!artistsByName.has(key)) artistsByName.set(key,[]); artistsByName.get(key).push(artist); }
+  for(const group of groups||[]) { groupByMbid.set(String(group.musicbrainz_release_group_mbid),group); const key=`${group.artist_id}|${group.normalized_title}`; if(!groupsByArtistTitle.has(key)) groupsByArtistTitle.set(key,[]); groupsByArtistTitle.get(key).push(group); }
+  return {artistByMbid,artistsByName,groupByMbid,groupsByArtistTitle};
+}
+function resolveListeningIdentity(track, index) {
+  const sourceArtist=lastfmTrackText(track,'artist'), sourceAlbum=lastfmTrackText(track,'album');
+  const artistMbid=safeMbId(track?.artist?.mbid), albumMbid=safeMbId(track?.album?.mbid);
+  let artist=artistMbid ? index.artistByMbid.get(artistMbid) : null;
+  let source=artist?'lastfm_artist_mbid_existing':null, confidence=artist?1:null;
+  if(!artist) { const exact=index.artistsByName.get(AchievementRules.normText(sourceArtist))||[]; if(exact.length===1) { artist=exact[0]; source='existing_canonical_artist_exact'; confidence=.95; } else if(exact.length>1) return {artist:null,group:null,source:'ambiguous_artist',confidence:null}; }
+  let group=albumMbid ? index.groupByMbid.get(albumMbid) : null;
+  if(group && artist && group.artist_id!==artist.id) return {artist,group:null,source:'ambiguous_album_artist_conflict',confidence:null};
+  if(group) { source='lastfm_release_group_mbid_existing'; confidence=1; }
+  else if(artist && sourceAlbum) { const exact=index.groupsByArtistTitle.get(`${artist.id}|${AchievementRules.normText(sourceAlbum)}`)||[]; if(exact.length===1) { group=exact[0]; source='existing_canonical_release_group_exact'; confidence=.95; } else if(exact.length>1) return {artist,group:null,source:'ambiguous_release_group',confidence:null}; }
+  return {artist,group,source:source||'unresolved',confidence};
+}
+function overlapCoverage(rows,start,end) {
+  const intervals=(rows||[]).filter(x=>x.status==='covered'&&Date.parse(x.coverage_end)>start&&Date.parse(x.coverage_start)<end).map(x=>[Math.max(start,Date.parse(x.coverage_start)),Math.min(end,Date.parse(x.coverage_end))]).sort((a,b)=>a[0]-b[0]);
+  let total=0,last=null; for(const range of intervals){ if(!last||range[0]>last[1]) { if(last) total+=last[1]-last[0]; last=[...range]; } else last[1]=Math.max(last[1],range[1]); } if(last) total+=last[1]-last[0]; return Math.max(0,Math.min(1,total/Math.max(1,end-start)));
+}
+async function listeningEvaluationInput(username) {
+  const now=Date.now(), sevenDays=now-7*86400000;
+  const [artists,releases,hours,dailyReleases,coverage,recent]=await Promise.all([
+    sb(`listening_lifetime_artist_counts?user_id=eq.${encodeURIComponent(username)}&select=artist_id,scrobble_count,music_artists!inner(display_name,musicbrainz_artist_mbid)&order=scrobble_count.desc&limit=100`),
+    sb(`listening_lifetime_release_group_counts?user_id=eq.${encodeURIComponent(username)}&select=release_group_id,scrobble_count,music_release_groups!inner(display_title,musicbrainz_release_group_mbid,music_artists!inner(display_name))&order=scrobble_count.desc&limit=100`),
+    sb(`listening_hour_totals?user_id=eq.${encodeURIComponent(username)}&local_hour=lt.5&select=local_date,local_hour,scrobble_count`),
+    sb(`listening_daily_release_group_counts?user_id=eq.${encodeURIComponent(username)}&select=local_date,release_group_id,scrobble_count,music_release_groups!inner(display_title,musicbrainz_release_group_mbid,music_artists!inner(display_name))&order=local_date.asc&limit=5000`),
+    sb(`listening_coverage_windows?user_id=eq.${encodeURIComponent(username)}&select=coverage_start,coverage_end,status`),
+    sb(`listening_scrobbles?user_id=eq.${encodeURIComponent(username)}&played_at=gte.${encodeURIComponent(new Date(sevenDays).toISOString())}&select=played_at,release_group_id&order=played_at.asc&limit=5000`)
+  ]);
+  const artistRows=(artists||[]).map(x=>({...x,...(x.music_artists||{})}));
+  const releaseRows=(releases||[]).map(x=>({...x,...(x.music_release_groups||{}),artist_name:x.music_release_groups?.music_artists?.display_name||''}));
+  const lucid={scrobbles:(hours||[]).reduce((n,x)=>n+Number(x.scrobble_count||0),0),days:[...new Set((hours||[]).filter(x=>Number(x.scrobble_count)>0).map(x=>x.local_date))]};
+  const byRelease=new Map(); for(const row of dailyReleases||[]) { const key=row.release_group_id; if(!byRelease.has(key)) byRelease.set(key,{release_group_id:key,display_title:row.music_release_groups?.display_title||'',musicbrainz_release_group_mbid:row.music_release_groups?.musicbrainz_release_group_mbid||null,artist_name:row.music_release_groups?.music_artists?.display_name||'',days:[],counts:new Map()}); const item=byRelease.get(key); item.days.push(row.local_date); item.counts.set(row.local_date,Number(row.scrobble_count||0)); }
+  const magnetic=[...byRelease.values()].map(row=>{ const streak=ListeningRules.maxConsecutive(row.days); return {...row,streak_scrobbles:streak.reduce((n,d)=>n+(row.counts.get(d)||0),0)}; });
+  const coveragePercent=overlapCoverage(coverage,sevenDays,now), byRecentRelease=new Map(); for(const row of recent||[]) if(row.release_group_id) byRecentRelease.set(row.release_group_id,(byRecentRelease.get(row.release_group_id)||0)+1);
+  const totalRecent=(recent||[]).length; let hyperfixation=null; for(const [release_group_id,album_count] of byRecentRelease){ if(!hyperfixation||album_count>hyperfixation.album_count){ const r=releaseRows.find(x=>x.release_group_id===release_group_id)||{}; hyperfixation={release_group:{id:release_group_id,mbid:r.musicbrainz_release_group_mbid||null,title:r.display_title||'',artist:r.artist_name||''},release_group_id,album_count,total:totalRecent,coverage:coveragePercent,window_start:new Date(sevenDays).toISOString(),window_end:new Date(now).toISOString()}; } }
+  return {artists:artistRows,releaseGroups:releaseRows,lucidDream:lucid,magnetic,hyperfixation};
+}
+async function refreshListeningRecords(username, input) {
+  const artist=(input.artists||[])[0], album=(input.releaseGroups||[])[0];
+  const hourRows=await sb(`listening_hour_totals?user_id=eq.${encodeURIComponent(username)}&select=local_hour,scrobble_count&order=scrobble_count.desc&limit=24`);
+  const dominant=(hourRows||[]).sort((a,b)=>Number(b.scrobble_count)-Number(a.scrobble_count))[0];
+  const now=new Date().toISOString(), rows=[];
+  if(artist) rows.push({user_id:username,record_key:'most_played_artist',value:{artist:{id:artist.artist_id,name:artist.display_name,mbid:artist.musicbrainz_artist_mbid||null},scrobbles:Number(artist.scrobble_count)},observed_at:now,updated_at:now});
+  if(album) rows.push({user_id:username,record_key:'most_played_album',value:{release_group:{id:album.release_group_id,title:album.display_title,artist:album.artist_name,mbid:album.musicbrainz_release_group_mbid||null},scrobbles:Number(album.scrobble_count)},observed_at:now,updated_at:now});
+  if(dominant) rows.push({user_id:username,record_key:'dominant_listening_hour',value:{local_hour:Number(dominant.local_hour),scrobbles:Number(dominant.scrobble_count)},observed_at:now,updated_at:now});
+  if(rows.length) await sb('vault_personal_records?on_conflict=user_id,record_key',{method:'POST',headers:{Prefer:'resolution=merge-duplicates,return=minimal'},body:JSON.stringify(rows)});
+}
+async function evaluateListeningAchievements(username, source='lastfm_sync') {
+  const input=await listeningEvaluationInput(username), evaluation=ListeningRules.evaluate(input);
+  await writeProgress(username,evaluation.progress);
+  await refreshListeningRecords(username,input);
+  return persistAchievementCandidates(username,evaluation.candidates,source,new Date().toISOString());
+}
+async function syncLastfmEpoch(epoch, trigger='scheduler') {
+  const lockToken=crypto.randomUUID();
+  const acquired=await sb('rpc/lastfm_try_lock',{method:'POST',body:JSON.stringify({p_epoch_id:epoch.id,p_lock_token:lockToken,p_seconds:90})});
+  if(!acquired) return {status:'locked'};
+  const runId=await startListeningSyncRun(epoch), before=Date.parse(epoch.watermark_played_at), started=Date.parse(epoch.lastfm_tracking_started_at), cutoff=Math.max(started,before-LASTFM_OVERLAP_MS);
+  let pages=0,observed=0,discarded=0,unresolved=0,ambiguous=0,lastfmStatus=200,reached=false,oldest=null,backlogCursor=null;
+  try {
+    const index=await canonicalListeningIndex(), collected=new Map();
+    // When a prior job hit its page cap, page 1 still captures fresh plays and
+    // the remaining budget walks older pages from the persisted continuation.
+    let continuation=epoch.backlog_cursor_before ? Date.parse(epoch.backlog_cursor_before) : null;
+    for(let page=1;page<=LASTFM_MAX_PAGES_PER_SYNC;page++) {
+      const params={method:'user.getrecenttracks',user:epoch.lastfm_username,limit:String(LASTFM_PAGE_SIZE),page:String(continuation?1:page)};
+      if(continuation) params.to=String(Math.floor(continuation/1000)-1);
+      let data; try { data=await lastfmApi(params); } catch(error) { lastfmStatus=Number(error.status)||0; error.lastfmCode=error.code; throw error; }
+      pages++; const tracks=Array.isArray(data?.recenttracks?.track)?data.recenttracks.track:(data?.recenttracks?.track?[data.recenttracks.track]:[]);
+      const confirmed=tracks.filter(confirmedLastfmTrack); observed+=confirmed.length;
+      for(const track of confirmed) {
+        const played=Number(track.date.uts)*1000; if(!Number.isFinite(played)) continue;
+        oldest=oldest===null?played:Math.min(oldest,played);
+        if(played<started) { discarded++; continue; }
+        const fingerprint=lastfmFingerprint(epoch.id,track); if(collected.has(fingerprint)) continue;
+        const identity=resolveListeningIdentity(track,index); if(!identity.group) { unresolved++; if(String(identity.source).startsWith('ambiguous')) ambiguous++; }
+        const local=localListeningParts(played,epoch.timezone);
+        collected.set(fingerprint,{artist_id:identity.artist?.id||null,release_group_id:identity.group?.id||null,source_artist:lastfmTrackText(track,'artist'),source_album:lastfmTrackText(track,'album')||null,source_track:String(track?.name||'').trim(),source_artist_mbid:safeMbId(track?.artist?.mbid),source_album_mbid:safeMbId(track?.album?.mbid),played_at:new Date(played).toISOString(),local_date:local.local_date,local_hour:local.local_hour,source_fingerprint:fingerprint,match_confidence:identity.confidence,match_source:identity.source});
+      }
+      if(oldest!==null&&oldest<=cutoff) { reached=true; break; }
+      const totalPages=Number(data?.recenttracks?.['@attr']?.totalPages||1);
+      if(!tracks.length || (!continuation && page>=totalPages)) { reached=true; break; }
+      continuation=oldest;
+      if(page===LASTFM_MAX_PAGES_PER_SYNC) backlogCursor=oldest;
+    }
+    const latestObserved=Math.max(before,...[...collected.values()].map(x=>Date.parse(x.played_at)).filter(Number.isFinite));
+    const now=Date.now(), coverageUntil=reached&&now-LASTFM_OVERLAP_MS> Date.parse(epoch.coverage_cursor_at) ? new Date(now-LASTFM_OVERLAP_MS).toISOString() : null;
+    const rows=await sb('rpc/lastfm_apply_sync_batch',{method:'POST',body:JSON.stringify({p_epoch_id:epoch.id,p_user_id:epoch.user_id,p_items:[...collected.values()],p_watermark:reached?new Date(latestObserved).toISOString():epoch.watermark_played_at,p_coverage_until:coverageUntil,p_backlog_cursor_before:reached?null:(backlogCursor?new Date(backlogCursor).toISOString():epoch.backlog_cursor_before||null)})});
+    const inserted=Number(rows?.[0]?.inserted||0), duplicates=Math.max(0,collected.size-inserted);
+    const unlocks=await evaluateListeningAchievements(epoch.user_id,'lastfm_sync');
+    await syncRunPatch(runId,{completed_at:new Date().toISOString(),status:reached?'success':'backlog',pages,observed,inserted,duplicates,discarded_pre_tracking:discarded,unresolved,ambiguous,watermark_after:reached?new Date(latestObserved).toISOString():epoch.watermark_played_at,coverage_until:coverageUntil,lastfm_status:lastfmStatus,metadata:{trigger,backlog_pending:!reached}});
+    console.log(JSON.stringify({event:'lastfm_sync',epoch:epoch.id.slice(0,8),pages,observed,inserted,duplicates,discarded_pre_tracking:discarded,unresolved,ambiguous,watermark_before:epoch.watermark_played_at,watermark_after:reached?new Date(latestObserved).toISOString():epoch.watermark_played_at,coverage_until:coverageUntil,status:reached?'success':'backlog'}));
+    return {status:reached?'success':'backlog',pages,observed,inserted,duplicates,unlocks:unlocks.length};
+  } catch(error) {
+    await sb(`lastfm_tracking_epochs?id=eq.${epoch.id}`,{method:'PATCH',headers:{Prefer:'return=minimal'},body:JSON.stringify({last_sync_at:new Date().toISOString(),last_error_at:new Date().toISOString(),last_error_code:String(error.lastfmCode||error.status||'sync_error'),consecutive_failures:Number(epoch.consecutive_failures||0)+1,updated_at:new Date().toISOString()})}).catch(()=>{});
+    await syncRunPatch(runId,{completed_at:new Date().toISOString(),status:'failed',pages,observed,discarded_pre_tracking:discarded,unresolved,ambiguous,lastfm_status:lastfmStatus,error_code:String(error.message||error).slice(0,160)}).catch(()=>{});
+    console.warn(JSON.stringify({event:'lastfm_sync_failed',epoch:epoch.id.slice(0,8),pages,lastfm_status:lastfmStatus,error:String(error.message||error).slice(0,140)}));
+    throw error;
+  } finally { await sb('rpc/lastfm_release_lock',{method:'POST',body:JSON.stringify({p_epoch_id:epoch.id,p_lock_token:lockToken})}).catch(()=>{}); }
+}
+async function syncConfiguredLastfmUser(username, trigger='scheduler') {
+  if(!isAchievementBetaUser(username)) return {status:'beta_disabled'};
+  const profile=await getVaultProfile(username), epoch=await activateLastfmTracking(username,profile||{});
+  if(!epoch) return {status:'not_configured'};
+  return syncLastfmEpoch(epoch,trigger);
+}
+async function syncAllConfiguredLastfmUsers(trigger='scheduler') {
+  const users=await sb('users?select=username,vault_profile&limit=50'); const results=[];
+  for(const row of users||[]) if(isAchievementBetaUser(row.username)) {
+    try { results.push({user_id:row.username,...await syncConfiguredLastfmUser(row.username,trigger)}); } catch(error) { results.push({user_id:row.username,status:'failed'}); }
+  }
+  return results;
+}
+async function listeningTrackingReadModel(username) {
+  const [active,coverage,records]=await Promise.all([
+    getActiveLastfmEpoch(username),
+    sb(`listening_coverage_windows?user_id=eq.${encodeURIComponent(username)}&select=coverage_start,coverage_end,status&order=coverage_end.desc&limit=12`),
+    sb(`vault_personal_records?user_id=eq.${encodeURIComponent(username)}&record_key=in.(most_played_artist,most_played_album,dominant_listening_hour)`)
+  ]);
+  // PostgREST range count is exposed in headers but the tiny helper intentionally
+  // avoids leaking headers; the compact exact count endpoint below is safe here.
+  const rows=await sb(`listening_scrobbles?user_id=eq.${encodeURIComponent(username)}&select=id&limit=5001`);
+  return {configured:Boolean(active),trackingStartedAt:active?.lastfm_tracking_started_at||null,epoch:active?{id:active.id,number:active.epoch_number,username:active.lastfm_username,watermark:active.watermark_played_at,lastSuccessAt:active.last_success_at,status:active.status,timezone:active.timezone}:null,trackedScrobbles:(rows||[]).length,coverage,records};
+}
 async function getCanonicalAchievementContext(username, eligibleEvents) {
   const albumIds=new Set((eligibleEvents||[]).map(e=>String(e?.payload?.album_id||AchievementRules.albumId(e?.payload?.album))).filter(Boolean));
   if(!albumIds.size) return {canonicalIdentityByAlbumId:{},releaseGroupsById:{},artistDiscographies:{}};
@@ -1204,14 +1412,7 @@ async function processAchievementEvent(username, eventId) {
   const evaluation = AchievementRules.evaluate({ event, eligibleEvents, ...identityContext });
   await writeProgress(username, evaluation.progress);
   await writeArtistAchievementProgress(username, evaluation.artistProgress);
-  const unlocks=[];
-  for (const c of evaluation.candidates) {
-    const definition=AchievementRules.DEFINITIONS.find(d=>d.key===c.key); if(!definition) continue;
-    const levelRarity=definition.metadata?.levelRarities?.[c.level-1] || definition.rarity;
-    const snapshot={ ...c.snapshot, level_rarity:levelRarity, source:event.source, occurred_at:event.occurred_at, rule_version:definition.ruleVersion };
-    const inserted=await sb('vault_achievement_unlocks?on_conflict=user_id,achievement_key,level',{method:'POST',headers:{Prefer:'resolution=ignore-duplicates,return=representation'},body:JSON.stringify({user_id:username,achievement_key:c.key,level:c.level,unlocked_at:new Date().toISOString(),source:event.source,rule_version:definition.ruleVersion,snapshot})});
-    if(Array.isArray(inserted)&&inserted[0]) { unlocks.push(inserted[0]); await sb('vault_achievement_inbox',{method:'POST',headers:{Prefer:'return=minimal'},body:JSON.stringify({user_id:username,unlock_id:inserted[0].id,source:event.source})}); }
-  }
+  const unlocks=await persistAchievementCandidates(username,evaluation.candidates,event.source,event.occurred_at);
   await refreshRatingRecords(username, eligibleEvents);
   await sb(`vault_achievement_events?event_id=eq.${eventId}`,{method:'PATCH',headers:{Prefer:'return=minimal'},body:JSON.stringify({processed_at:new Date().toISOString(),unlock_ids:unlocks.map(u=>u.id)})});
   return unlocks;
@@ -1549,6 +1750,24 @@ app.post('/music-identity/resolve', express.json(), async (req,res) => {
     scheduleIdentityResolution(username);
     res.status(202).json({ok:true,queued:true});
   } catch(error) { console.error('[music identity resolve]',error.message); res.status(500).json({error:'No se pudo iniciar la resolución'}); }
+});
+// Phase 2 read/refresh endpoints reuse the existing Vault session and profile
+// username. They never accept a Last.fm username, timestamps or fingerprints
+// from the browser.
+app.post('/listening/me', express.json(), async (req,res) => {
+  try {
+    const username=await verifyToken(req.body?.token); if(!username) return res.status(401).json({error:'Sesión inválida o expirada'});
+    if(!isAchievementBetaUser(username)) return res.json({ok:true,beta:false});
+    res.json({ok:true,beta:true,...await listeningTrackingReadModel(username)});
+  } catch(error) { console.error('[listening read]',error.message); res.status(500).json({error:'No se pudo leer el tracking de Last.fm'}); }
+});
+app.post('/listening/sync', express.json(), async (req,res) => {
+  try {
+    const username=await verifyToken(req.body?.token); if(!username) return res.status(401).json({error:'Sesión inválida o expirada'});
+    if(!isAchievementBetaUser(username)) return res.json({ok:true,beta:false});
+    const result=await syncConfiguredLastfmUser(username,'manual_refresh');
+    res.json({ok:true,...result,...await listeningTrackingReadModel(username)});
+  } catch(error) { console.error('[listening manual sync]',error.message); res.status(502).json({error:'No se pudo sincronizar Last.fm ahora'}); }
 });
 app.post('/achievements/inbox/consume', express.json(), async (req,res) => {
   try { const username=await verifyToken(req.body?.token); if(!username) return res.status(401).json({error:'Sesión inválida o expirada'}); if(!isAchievementBetaUser(username)) return res.json({ok:true,beta:false}); const ids=(req.body?.ids||[]).filter(x=>typeof x==='string').slice(0,20); if(ids.length) await sb(`vault_achievement_inbox?user_id=eq.${encodeURIComponent(username)}&id=in.(${ids.map(encodeURIComponent).join(',')})`,{method:'PATCH',headers:{Prefer:'return=minimal'},body:JSON.stringify({delivered_at:new Date().toISOString()})}); res.json({ok:true}); }
@@ -1890,6 +2109,21 @@ app.post('/auth/discord/finish', express.json(), async (req, res) => {
   }
 });
 
+// Invoked only by Supabase pg_cron through pg_net. The secret lives in the
+// private scheduler table; this route derives no user id from the request.
+function schedulerTokenMatches(provided, expected) {
+  const a=Buffer.from(String(provided||'')), b=Buffer.from(String(expected||''));
+  return a.length===b.length && a.length>0 && crypto.timingSafeEqual(a,b);
+}
+app.post('/internal/lastfm/sync', express.json({limit:'16kb'}), async (req,res) => {
+  try {
+    const config=(await sb('listening_scheduler_config?singleton=eq.true&select=scheduler_token&limit=1'))?.[0];
+    if(!config || !schedulerTokenMatches(req.get('x-album-vault-scheduler'),config.scheduler_token)) return res.status(403).json({error:'Forbidden'});
+    const results=await syncAllConfiguredLastfmUsers('supabase_cron');
+    res.json({ok:true,results:results.map(x=>({status:x.status,pages:x.pages||0,inserted:x.inserted||0}))});
+  } catch(error) { console.error('[lastfm scheduler]',error.message); res.status(500).json({error:'Listening sync failed'}); }
+});
+
 // Respuesta compacta y observable para cuerpos demasiado grandes. Sin este
 // manejador Express imprimía el stack completo repetidamente y el cliente no
 // recibía una causa útil para detener el intento.
@@ -1910,6 +2144,9 @@ app.listen(PORT, () => {
   // Phase 1.5 backfill is bounded, persisted and restartable. It resolves
   // identity only; historical Vault facts remain ineligible for achievements.
   setTimeout(() => { schedulePrivateIdentityBackfill().catch(error => console.error('[music identity startup]',error.message)); }, 10000);
+  // Startup is merely a fast first attempt. Supabase Cron is the durable
+  // scheduler and continues waking this endpoint even while Render sleeps.
+  setTimeout(() => { syncAllConfiguredLastfmUsers('startup').catch(error => console.error('[lastfm startup]',error.message)); }, 15000);
 });
 
       
