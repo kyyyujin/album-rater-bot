@@ -1361,16 +1361,17 @@ async function syncLastfmEpoch(epoch, trigger='scheduler') {
     throw error;
   } finally { await sb('rpc/lastfm_release_lock',{method:'POST',body:JSON.stringify({p_epoch_id:epoch.id,p_lock_token:lockToken})}).catch(()=>{}); }
 }
-async function syncConfiguredLastfmUser(username, trigger='scheduler') {
+async function syncConfiguredLastfmUser(username, trigger='scheduler', profileOverride=undefined) {
   if(!isAchievementBetaUser(username)) return {status:'beta_disabled'};
-  const profile=await getVaultProfile(username), epoch=await activateLastfmTracking(username,profile||{});
+  const profile=profileOverride===undefined ? await getVaultProfile(username) : profileOverride;
+  const epoch=await activateLastfmTracking(username,profile||{});
   if(!epoch) return {status:'not_configured'};
   return syncLastfmEpoch(epoch,trigger);
 }
 async function syncAllConfiguredLastfmUsers(trigger='scheduler') {
   const users=await sb('users?select=username,vault_profile&limit=50'); const results=[];
   for(const row of users||[]) if(isAchievementBetaUser(row.username)) {
-    try { results.push({user_id:row.username,...await syncConfiguredLastfmUser(row.username,trigger)}); } catch(error) { results.push({user_id:row.username,status:'failed'}); }
+    try { results.push({user_id:row.username,...await syncConfiguredLastfmUser(row.username,trigger,row.vault_profile||{})}); } catch(error) { results.push({user_id:row.username,status:'failed'}); }
   }
   return results;
 }
