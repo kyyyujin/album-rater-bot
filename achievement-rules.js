@@ -26,6 +26,10 @@ const DEFINITIONS = DEFINITION_ROWS.map(([key,title,rarity,maxLevel]) => ({
   ruleVersion:['generational_run','icon','artist_archivist'].includes(key)?2:1,
   metadata:DEFINITION_META[key] || {}
 }));
+// Listening definitions are evaluated only by the server-side ledger worker.
+// Keeping the public display metadata here lets the existing Achievement Vault
+// render the active catalogue without shipping any secret rule logic.
+for (const listening of require('./listening-rules').DEFINITIONS) DEFINITIONS.push(listening);
 
 function score(v){ const n=Number(v); return Number.isFinite(n) ? Math.round((n+Number.EPSILON)*100)/100 : null; }
 function tier(s){ s=score(s); if(s===null)return null; if(s===10)return'SS'; if(s>=9.8)return'S+'; if(s>=9.4)return'S'; if(s>=9)return'S−'; if(s>=8.9)return'A+'; if(s>=8.8)return'A'; if(s>=8.7)return'A−'; if(s>=8.5)return'B+'; if(s>=8)return'B−'; if(s>=7.5)return'C+'; return'C−'; }
