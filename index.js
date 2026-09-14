@@ -1308,6 +1308,7 @@ async function refreshListeningRecords(username, input) {
   if(rows.length) await sb('vault_personal_records?on_conflict=user_id,record_key',{method:'POST',headers:{Prefer:'resolution=merge-duplicates,return=minimal'},body:JSON.stringify(rows)});
 }
 async function evaluateListeningAchievements(username, source='lastfm_sync') {
+  await ensureAchievementDefinitions();
   const input=await listeningEvaluationInput(username), evaluation=ListeningRules.evaluate(input);
   await writeProgress(username,evaluation.progress);
   await refreshListeningRecords(username,input);
