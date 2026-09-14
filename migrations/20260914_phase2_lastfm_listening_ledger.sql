@@ -203,7 +203,7 @@ $$;
 create or replace function public.lastfm_apply_sync_batch(p_epoch_id uuid, p_user_id text, p_items jsonb, p_watermark timestamptz, p_coverage_until timestamptz, p_backlog_cursor_before timestamptz default null)
 returns table(inserted integer, watermark_played_at timestamptz, coverage_cursor_at timestamptz)
 language plpgsql security definer set search_path=public as $$
-declare v_epoch public.lastfm_tracking_epochs; v_inserted integer:=0;
+declare v_epoch public.lastfm_tracking_epochs; v_inserted integer:=0; v_new_watermark timestamptz; v_new_coverage timestamptz;
 begin
   select * into v_epoch from public.lastfm_tracking_epochs where id=p_epoch_id and user_id=p_user_id and status='active' for update;
   if not found then raise exception 'inactive or unknown Last.fm epoch'; end if;
@@ -249,9 +249,9 @@ begin
     insert into public.listening_coverage_windows(user_id,epoch_id,coverage_start,coverage_end,status,reason)
     values(p_user_id,p_epoch_id,v_epoch.coverage_cursor_at,p_coverage_until,'covered','recenttracks_reconciled');
   end if;
-  update public.lastfm_tracking_epochs set watermark_played_at=greatest(watermark_played_at,coalesce(p_watermark,watermark_played_at)),backlog_cursor_before=p_backlog_cursor_before,coverage_cursor_at=greatest(coverage_cursor_at,coalesce(p_coverage_until,coverage_cursor_at)),last_sync_at=clock_timestamp(),last_success_at=clock_timestamp(),last_error_at=null,last_error_code=null,consecutive_failures=0,updated_at=clock_timestamp()
-  where id=p_epoch_id returning public.lastfm_tracking_epochs.watermark_played_at,public.lastfm_tracking_epochs.coverage_cursor_at into watermark_played_at,coverage_cursor_at;
-  inserted:=v_inserted; return next;
+  update public.lastfm_tracking_epochs as e set watermark_played_at=greatest(e.watermark_played_at,coalesce(p_watermark,e.watermark_played_at)),backlog_cursor_before=p_backlog_cursor_before,coverage_cursor_at=greatest(e.coverage_cursor_at,coalesce(p_coverage_until,e.coverage_cursor_at)),last_sync_at=clock_timestamp(),last_success_at=clock_timestamp(),last_error_at=null,last_error_code=null,consecutive_failures=0,updated_at=clock_timestamp()
+  where e.id=p_epoch_id returning e.watermark_played_at,e.coverage_cursor_at into v_new_watermark,v_new_coverage;
+  return query select v_inserted,v_new_watermark,v_new_coverage;
 end $$;
 
 create or replace function public.enqueue_lastfm_sync()
