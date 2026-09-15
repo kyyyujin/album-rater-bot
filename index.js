@@ -7,6 +7,7 @@ const puppeteer = require('puppeteer');
 const { Client, GatewayIntentBits, REST, Routes, SlashCommandBuilder, EmbedBuilder } = require('discord.js');
 const AchievementRules = require('./achievement-rules');
 const ListeningRules = require('./listening-rules');
+const { normalizeIanaTimezone, localListeningParts } = require('./timezone-utils');
 
 const app    = express();
 // Render's small instances are memory constrained. libvips must not retain a
@@ -24,10 +25,7 @@ const BOT_TOKEN    = process.env.BOT_TOKEN;
 const CLIENT_ID    = process.env.CLIENT_ID;
 const SUPABASE_URL = process.env.SUPABASE_URL;
 const SUPABASE_KEY = process.env.SUPABASE_KEY;
-// The legacy browser integration already uses this public Last.fm application
-// key. Phase 2 keeps all ledger requests server-side and prefers an env key so
-// it can be rotated without a client release.
-const LASTFM_API_KEY = process.env.LASTFM_API_KEY || '194ec400973f470ddaccd3248100186f';
+const LASTFM_API_KEY = process.env.LASTFM_API_KEY;
 const LASTFM_API_BASE = 'https://ws.audioscrobbler.com/2.0/';
 const LASTFM_OVERLAP_MS = 10 * 60 * 1000;
 const LASTFM_MAX_PAGES_PER_SYNC = 5;
@@ -1209,12 +1207,6 @@ async function schedulePrivateIdentityBackfill() {
 // Existing browser polling remains only a visual "Now Listening" feature.  The
 // following worker is the sole writer of tracked scrobbles and achievements.
 function normalizedLastfmUsername(value) { return String(value||'').trim().toLowerCase(); }
-function validIanaTimezone(value) { try { Intl.DateTimeFormat('en-US',{timeZone:value||'UTC'}); return value||'UTC'; } catch (_) { return 'UTC'; } }
-function localListeningParts(playedAt, timezone) {
-  const parts=new Intl.DateTimeFormat('en-CA',{timeZone:validIanaTimezone(timezone),year:'numeric',month:'2-digit',day:'2-digit',hour:'2-digit',hourCycle:'h23'}).formatToParts(new Date(playedAt));
-  const out=Object.fromEntries(parts.filter(x=>x.type!=='literal').map(x=>[x.type,x.value]));
-  return {local_date:`${out.year}-${out.month}-${out.day}`,local_hour:Number(out.hour)};
-}
 function sha256(value) { return crypto.createHash('sha256').update(value).digest('hex'); }
 function lastfmTrackText(track, field) { const value=track?.[field]; return String(value?.['#text'] || value?.name || value || '').trim(); }
 function confirmedLastfmTrack(track) { return Boolean(track?.date?.uts) && !track?.['@attr']?.nowplaying; }
@@ -1223,12 +1215,45 @@ function lastfmFingerprint(epochId, track) {
   return sha256([epochId,uts,AchievementRules.normText(lastfmTrackText(track,'artist')),AchievementRules.normText(lastfmTrackText(track,'name')),AchievementRules.normText(lastfmTrackText(track,'album')),safeMbId(track?.artist?.mbid)||'',safeMbId(track?.album?.mbid)||'',safeMbId(track?.mbid)||''].join('|'));
 }
 async function lastfmApi(params) {
+  if(!LASTFM_API_KEY) { const error=new Error('Last.fm is not configured'); error.code='lastfm_not_configured'; throw error; }
   const url=`${LASTFM_API_BASE}?${new URLSearchParams({...params,api_key:LASTFM_API_KEY,format:'json'}).toString()}`;
   const res=await fetch(url,{headers:{Accept:'application/json','User-Agent':'AlbumVault/2.0 (listening ledger)'}});
   const data=await res.json().catch(()=>({}));
   if(!res.ok || data?.error) { const error=new Error(data?.message||`Last.fm ${res.status}`); error.status=res.status; error.code=data?.error||null; throw error; }
   return data;
 }
+const PUBLIC_LASTFM_PARAMS = {
+  'album.getinfo': ['artist','album','username','autocorrect'],
+  'album.search': ['album','artist','limit','page'],
+  'artist.gettopalbums': ['artist','limit','page'],
+  'user.getrecenttracks': ['user','limit','page','from','to','extended']
+};
+function publicLastfmParams(query) {
+  const method=String(query?.method||'').toLowerCase();
+  const allowed=PUBLIC_LASTFM_PARAMS[method];
+  if(!allowed) return null;
+  const params={method};
+  for(const key of allowed) {
+    const value=String(query?.[key]??'').trim();
+    if(value && value.length<=300) params[key]=value;
+  }
+  if(params.limit) params.limit=String(Math.max(1,Math.min(200,Number.parseInt(params.limit,10)||1)));
+  if(params.page) params.page=String(Math.max(1,Math.min(10000,Number.parseInt(params.page,10)||1)));
+  if(params.from) params.from=String(Math.max(0,Number.parseInt(params.from,10)||0));
+  if(params.to) params.to=String(Math.max(0,Number.parseInt(params.to,10)||0));
+  return params;
+}
+app.get('/lastfm', async (req,res) => {
+  const params=publicLastfmParams(req.query);
+  if(!params) return res.status(400).json({error:'Unsupported Last.fm method'});
+  try {
+    const data=await lastfmApi(params);
+    res.set('Cache-Control',params.method==='user.getrecenttracks'?'no-store':'public, max-age=300');
+    res.json(data);
+  } catch(error) {
+    res.status(Number(error.status)||502).json({error:error.code||'lastfm_error',message:String(error.message||'Last.fm request failed').slice(0,160)});
+  }
+});
 async function validateLastfmUsername(username) {
   const data=await lastfmApi({method:'user.getinfo',user:username});
   return Boolean(data?.user?.name);
@@ -1241,9 +1266,15 @@ async function activateLastfmTracking(username, profile) {
   const configured=String(profile?.lastfmUsername||'').trim();
   const active=await getActiveLastfmEpoch(username);
   if(!configured) { if(active) await sb('rpc/lastfm_pause_active_epoch',{method:'POST',body:JSON.stringify({p_user_id:username,p_reason:'username_removed'})}); return null; }
-  if(active && active.normalized_username===normalizedLastfmUsername(configured)) return active;
+  const timezone=normalizeIanaTimezone(profile?.timezone || active?.timezone || 'UTC');
+  if(active && active.normalized_username===normalizedLastfmUsername(configured)) {
+    if(active.timezone!==timezone) {
+      await sb('rpc/set_user_listening_timezone',{method:'POST',body:JSON.stringify({p_user_id:username,p_timezone:timezone})});
+      return getActiveLastfmEpoch(username);
+    }
+    return active;
+  }
   await validateLastfmUsername(configured);
-  const timezone=validIanaTimezone(profile?.timezone || 'UTC');
   const rows=await sb('rpc/lastfm_activate_epoch',{method:'POST',body:JSON.stringify({p_user_id:username,p_username:configured,p_timezone:timezone})});
   return rows?.[0] || null;
 }
@@ -1369,9 +1400,10 @@ async function syncConfiguredLastfmUser(username, trigger='scheduler', profileOv
   return syncLastfmEpoch(epoch,trigger);
 }
 async function syncAllConfiguredLastfmUsers(trigger='scheduler') {
-  const users=await sb('users?select=username,vault_profile&limit=50'); const results=[];
+  const users=await sb('users?select=username,timezone,vault_profile&limit=50'); const results=[];
   for(const row of users||[]) if(isAchievementBetaUser(row.username)) {
-    try { results.push({user_id:row.username,...await syncConfiguredLastfmUser(row.username,trigger,row.vault_profile||{})}); } catch(error) { results.push({user_id:row.username,status:'failed'}); }
+    const profile={...(row.vault_profile||{}),timezone:row.timezone||row.vault_profile?.timezone||'UTC'};
+    try { results.push({user_id:row.username,...await syncConfiguredLastfmUser(row.username,trigger,profile)}); } catch(error) { results.push({user_id:row.username,status:'failed'}); }
   }
   return results;
 }
@@ -1545,20 +1577,26 @@ async function runVaultCoverQualityMigration() {
 // ── Perfil de Vault (banner, bio, favoritos elegidos a mano) ──
 // Requiere en Supabase la columna (nullable): users.vault_profile jsonb
 async function saveVaultProfile(username, profile) {
+  const current=await getVaultProfile(username);
+  const timezone=normalizeIanaTimezone(profile?.timezone || current?.timezone || 'UTC');
+  await sb('rpc/set_user_listening_timezone',{method:'POST',body:JSON.stringify({p_user_id:username,p_timezone:timezone})});
+  const storedProfile=profile==null ? {timezone} : {...profile,timezone};
   const res = await fetch(`${SUPABASE_URL}/rest/v1/users?username=eq.${encodeURIComponent(username)}`, {
     method: 'PATCH',
     headers: { 'Content-Type': 'application/json', 'apikey': SUPABASE_KEY, 'Authorization': `Bearer ${SUPABASE_KEY}`, 'Prefer': 'return=minimal' },
-    body: JSON.stringify({ vault_profile: profile })
+    body: JSON.stringify({ vault_profile: storedProfile })
   });
   if (!res.ok) { const err = await res.text(); throw new Error(err); }
 }
 
 async function getVaultProfile(username) {
-  const res = await fetch(`${SUPABASE_URL}/rest/v1/users?username=eq.${encodeURIComponent(username)}&select=vault_profile&limit=1`, {
+  const res = await fetch(`${SUPABASE_URL}/rest/v1/users?username=eq.${encodeURIComponent(username)}&select=vault_profile,timezone&limit=1`, {
     headers: { 'apikey': SUPABASE_KEY, 'Authorization': `Bearer ${SUPABASE_KEY}` }
   });
   const data = await res.json();
-  return data[0]?.vault_profile || null;
+  const row=data[0];
+  if(!row) return null;
+  return {...(row.vault_profile||{}),timezone:row.timezone||row.vault_profile?.timezone||null};
 }
 
 app.post('/register', express.json(), async (req, res) => {
