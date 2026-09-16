@@ -4,7 +4,7 @@
   "main": "index.js",
   "scripts": {
     "start": "node index.js",
-    "test": "node achievement-rules.test.js && node lastfm-tracking.test.js && node timezone-utils.test.js && node listening-intelligence.test.js && node listening-rules.test.js && node aggregate-reconciliation.test.js && node enrichment-reliability.test.js && node scheduler-isolation.test.js",
+    "test": "node achievement-rules.test.js && node lastfm-tracking.test.js && node timezone-utils.test.js && node listening-intelligence.test.js && node listening-rules.test.js && node aggregate-reconciliation.test.js && node enrichment-reliability.test.js && node scheduler-isolation.test.js && node hybrid-rules.test.js && node period-intelligence.test.js && node secret-visibility.test.js && node phase3b-schema.test.js",
     "postinstall": "puppeteer browsers install chrome"
   },
   "dependencies": {

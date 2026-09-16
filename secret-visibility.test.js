@@ -1,0 +1,10 @@
+'use strict';
+const assert=require('assert');
+const {maskAchievementDefinitions}=require('./secret-visibility');
+const definition={key:'paper_favorite',title:'Paper Favorite',rarity:'Epic',is_secret:true,client_metadata:{secret:true,rule_hint:'must not leak'}};
+const locked=maskAchievementDefinitions([definition],[])[0];
+assert.strictEqual(locked.title,'???'); assert.strictEqual(locked.rarity,null); assert.strictEqual(locked.client_metadata.rule_hint,undefined); assert.strictEqual(locked.client_metadata.locked_label,'Hidden Achievement');
+assert.strictEqual(locked.key,'visible_secret_slot_1','the semantic key must not reveal the Secret');
+const unlocked=maskAchievementDefinitions([definition],[{achievement_key:'paper_favorite'}])[0];
+assert.strictEqual(unlocked.title,'Paper Favorite'); assert.strictEqual(unlocked.rarity,'Epic');
+console.log('secret visibility tests passed');
