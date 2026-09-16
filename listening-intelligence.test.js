@@ -43,9 +43,14 @@ assert.equal(Intelligence.detectAlbumRuns(rows, tracklists, [{ status: 'coverage
 
 let sessions = Intelligence.buildSessions(rows, []);
 assert.equal(sessions.length, 1); assert.equal(sessions[0].identity_status, 'resolved');
+assert.equal(Intelligence.buildSessions([rows[0], {...rows[1], played_at:new Date(Date.parse(rows[0].played_at)+11*60000).toISOString()}], []).length, 1, 'small projected interruption remains in the session');
 sessions = Intelligence.buildSessions([...rows.slice(0, 2), { ...rows[2], played_at: new Date(start + 2 * 60 * 60 * 1000).toISOString() }], []);
 assert.equal(sessions.length, 2, 'excessive interruption splits sessions');
+assert.equal(Intelligence.buildSessions([rows[0], {...rows[1],release_group_id:'other'}], []).length, 1, 'an album change is retained as session evidence for sequence analysis');
+assert.equal(Intelligence.detectAlbumRuns([rows[0],rows[1],rows[1],...rows.slice(2)], tracklists, []).length, 0, 'a repeated in-album track invalidates the ordered run');
 assert.equal(Intelligence.buildSessions([{ ...rows[0], duration_ms: null }, rows[1]], [])[0].duration_status, 'partial', 'unknown duration is explicit');
+assert.equal(Intelligence.buildSessions([{...rows[0],track_id:null},rows[1]], [])[0].identity_status, 'partial', 'an unresolved track is explicit');
+assert.equal(Intelligence.buildSessions(rows, [{status:'coverage_gap',coverage_start:new Date(start).toISOString(),coverage_end:new Date(start+1000).toISOString()}])[0].coverage_status, 'gap', 'a coverage gap is preserved on the session');
 
 const plays = n => Array.from({ length: n }, (_, i) => ({ id: `p${i}`, track_id: 'recording-a', played_at: new Date(start + i * HOUR).toISOString() }));
 const HOUR = 3600000;
