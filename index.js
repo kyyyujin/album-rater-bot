@@ -9,6 +9,8 @@ const AchievementRules = require('./achievement-rules');
 const ListeningRules = require('./listening-rules');
 const ListeningIntelligence = require('./listening-intelligence');
 const { normalizeIanaTimezone, localListeningParts } = require('./timezone-utils');
+const { classifyEnrichmentError, parseRetryAfter, retryDelayMs } = require('./enrichment-reliability');
+const { createSchedulerPipelines } = require('./scheduler-pipelines');
 
 const app    = express();
 // Render's small instances are memory constrained. libvips must not retain a
@@ -1051,7 +1053,12 @@ async function mbJson(path) {
     mbNextRequestAt=Date.now()+1100; // MusicBrainz public API: at most one request/sec.
     const url=`${MB_API_BASE}${path}${path.includes('?')?'&':'?'}fmt=json`;
     const response=await fetch(url,{headers:{Accept:'application/json','User-Agent':'AlbumVault/1.5 (identity resolver)'}});
-    if(!response.ok) { const error=new Error(`MusicBrainz ${response.status}`); error.status=response.status; throw error; }
+    if(!response.ok) {
+      const error=new Error(`MusicBrainz ${response.status}`);
+      error.status=response.status;
+      error.retryAfterMs=parseRetryAfter(response.headers.get('retry-after'));
+      throw error;
+    }
     return response.json();
   });
   mbRequestChain=run.catch(()=>{});
@@ -1436,11 +1443,14 @@ async function enrichListeningScrobble(job) {
     await finishEnrichmentJob(job,status,reason);
     return {...scrobble,artist_id:artist?.id||null,release_group_id:groupRow.id,track_id:track?.id||null,release_track_id:releaseTrack?.id||null,enrichment_status:status};
   } catch(error) {
-    const reason=error.resolution||(/MusicBrainz (429|5\d\d)/.test(error.message)?'musicbrainz_temporary_error':'enrichment_error');
-    const retry=error.retry||/MusicBrainz (429|5\d\d)/.test(error.message);
-    const status=retry?'retry':String(reason).startsWith('ambiguous')?'ambiguous':'unresolved';
-    const delay=retry?(reason==='musicbrainz_no_unequivocal_album_match'?14*86400000:Math.min(24*3600000,15*60000*(2**Math.min(6,Number(job.attempts||1)-1)))):null;
-    await sb('rpc/listening_reconcile_scrobble_identity',{method:'POST',body:JSON.stringify({p_scrobble_id:scrobble.id,p_artist_id:scrobble.artist_id,p_release_group_id:scrobble.release_group_id,p_track_id:scrobble.track_id,p_release_track_id:scrobble.release_track_id,p_status:status,p_reason:reason,p_match_source:scrobble.match_source,p_match_confidence:scrobble.match_confidence,p_metadata:{last_error:String(error.message||error).slice(0,160)}})}).catch(()=>{});
+    const classified=classifyEnrichmentError(error), {status,reason}=classified;
+    const delay=classified.retryable?retryDelayMs(job.attempts,error.retryAfterMs):null;
+    const metadata={last_error:String(error.message||error).slice(0,160),error_category:classified.category,retryable:classified.retryable};
+    if(status==='failed') {
+      await sb(`listening_scrobbles?id=eq.${scrobble.id}`,{method:'PATCH',headers:{Prefer:'return=minimal'},body:JSON.stringify({enrichment_status:status,enrichment_reason:reason,enrichment_metadata:metadata,enriched_at:new Date().toISOString()})}).catch(()=>{});
+    } else {
+      await sb('rpc/listening_reconcile_scrobble_identity',{method:'POST',body:JSON.stringify({p_scrobble_id:scrobble.id,p_artist_id:scrobble.artist_id,p_release_group_id:scrobble.release_group_id,p_track_id:scrobble.track_id,p_release_track_id:scrobble.release_track_id,p_status:status,p_reason:reason,p_match_source:scrobble.match_source,p_match_confidence:scrobble.match_confidence,p_metadata:metadata})}).catch(()=>{});
+    }
     await finishEnrichmentJob(job,status,reason,error,delay);
     return {...scrobble,enrichment_status:status,enrichment_reason:reason};
   }
@@ -1617,8 +1627,6 @@ async function syncAllConfiguredLastfmUsers(trigger='scheduler') {
     const profile={...(row.vault_profile||{}),timezone:row.timezone||row.vault_profile?.timezone||'UTC'};
     try { results.push({user_id:row.username,...await syncConfiguredLastfmUser(row.username,trigger,profile)}); } catch(error) { results.push({user_id:row.username,status:'failed'}); }
   }
-  try { results.push({user_id:'system',status:'enrichment',...await runListeningEnrichmentBatch(3)}); }
-  catch(error) { console.warn('[listening enrichment]',error.message); results.push({user_id:'system',status:'enrichment_failed'}); }
   return results;
 }
 async function listeningTrackingReadModel(username) {
@@ -2369,19 +2377,22 @@ function schedulerTokenMatches(provided, expected) {
   const a=Buffer.from(String(provided||'')), b=Buffer.from(String(expected||''));
   return a.length===b.length && a.length>0 && crypto.timingSafeEqual(a,b);
 }
+const schedulerPipelines=createSchedulerPipelines({syncAll:syncAllConfiguredLastfmUsers,enrichBatch:runListeningEnrichmentBatch});
 app.post('/internal/lastfm/sync', express.json({limit:'16kb'}), async (req,res) => {
   try {
     const config=(await sb('listening_scheduler_config?singleton=eq.true&select=scheduler_token&limit=1'))?.[0];
     if(!config || !schedulerTokenMatches(req.get('x-album-vault-scheduler'),config.scheduler_token)) return res.status(403).json({error:'Forbidden'});
-    const results=await syncAllConfiguredLastfmUsers('supabase_cron');
-    res.json({ok:true,results:results.map(x=>({status:x.status,pages:x.pages||0,inserted:x.inserted||0}))});
+    const {results,duration_ms}=await schedulerPipelines.sync('supabase_cron');
+    console.log(JSON.stringify({event:'lastfm_sync_endpoint',duration_ms,status:'success'}));
+    res.json({ok:true,duration_ms,results:results.map(x=>({status:x.status,pages:x.pages||0,inserted:x.inserted||0}))});
   } catch(error) { console.error('[lastfm scheduler]',error.message); res.status(500).json({error:'Listening sync failed'}); }
 });
 app.post('/internal/listening/enrich', express.json({limit:'16kb'}), async (req,res) => {
   try {
     const config=(await sb('listening_scheduler_config?singleton=eq.true&select=scheduler_token&limit=1'))?.[0];
     if(!config || !schedulerTokenMatches(req.get('x-album-vault-scheduler'),config.scheduler_token)) return res.status(403).json({error:'Forbidden'});
-    const result=await runListeningEnrichmentBatch(Math.max(1,Math.min(10,Number(req.body?.limit)||3)));
+    const result=await schedulerPipelines.enrich(Math.max(1,Math.min(10,Number(req.body?.limit)||1)));
+    console.log(JSON.stringify({event:'listening_enrichment_endpoint',duration_ms:result.duration_ms,processed:result.processed,status:'success'}));
     res.json({ok:true,...result});
   } catch(error) { console.error('[listening enrichment endpoint]',error.message); res.status(500).json({error:'Listening enrichment failed'}); }
 });
