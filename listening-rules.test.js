@@ -25,4 +25,11 @@ r=Rules.evaluate({magnetic:[{release_group_id:'rg',days:['2026-01-01','2026-01-0
 assert(has(r,'magnetic'),'Magnetic exact boundary');
 r=Rules.evaluate({magnetic:[{release_group_id:'rg',days:['2026-01-01','2026-01-02','2026-01-03','2026-01-04','2026-01-05','2026-01-06','2026-01-07'],streak_scrobbles:13}]});
 assert(!has(r,'magnetic'),'Magnetic needs 14 plays');
-console.log('PASS listening levels, Hyperfixation, Lucid Dream and Magnetic thresholds');
+const start=Date.parse('2026-01-01T00:00:00Z');
+const tracks=Array.from({length:10},(_,i)=>({id:`p${i}`,track_id:'rec',played_at:new Date(start+i*3600000).toISOString()}));
+r=Rules.evaluate({tracks,trackCounts:[{track_id:'rec',scrobble_count:10}],trackById:{rec:{musicbrainz_recording_mbid:'mbid',display_title:'Song'}}});
+assert(has(r,'i_cant_stop_me'),'I CAN\'T STOP ME exact boundary');
+const run={release_group_id:'rg',local_date:'2026-01-01',started_at:'2026-01-01T00:00:00Z',ended_at:'2026-01-01T00:30:00Z',elapsed_ms:1800000,total_duration_ms:1800000,foreign_scrobble_count:0,track_timestamps:[],qualifies_dash:true,release_group:{id:'rg',title:'Album'}};
+r=Rules.evaluate({albumRuns:[run]}); assert(has(r,'album_run')&&has(r,'dash')&&!has(r,'deja_vu'),'single exact run unlocks Album Run and DASH only');
+r=Rules.evaluate({albumRuns:[run,{...run,started_at:'2026-01-01T03:00:00Z',ended_at:'2026-01-01T03:30:00Z'}]}); assert(has(r,'deja_vu'),'two valid runs same local day unlock Déjà Vu');
+console.log('PASS listening levels, Phase 2 thresholds and Phase 3A exact achievements');

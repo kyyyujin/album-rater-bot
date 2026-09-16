@@ -4,6 +4,7 @@
   "main": "index.js",
   "scripts": {
     "start": "node index.js",
+    "test": "node achievement-rules.test.js && node lastfm-tracking.test.js && node timezone-utils.test.js && node listening-intelligence.test.js && node listening-rules.test.js && node aggregate-reconciliation.test.js",
     "postinstall": "puppeteer browsers install chrome"
   },
   "dependencies": {

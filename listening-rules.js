@@ -1,5 +1,6 @@
 /* Phase 2 listening rules. They consume only the server-maintained ledger. */
 'use strict';
+const Intelligence = require('./listening-intelligence');
 
 const LEVELS = { on_repeat:[25,100,250], dedicated:[100,500,1500] };
 const DEFINITIONS = [
@@ -8,9 +9,10 @@ const DEFINITIONS = [
   {key:'hyperfixation',title:'Hyperfixation',category:'Listening',rarity:'Epic',maxLevel:1,ruleVersion:1,metadata:{}},
   {key:'lucid_dream',title:'Lucid Dream',category:'Listening',rarity:'Rare',maxLevel:1,ruleVersion:1,metadata:{}},
   {key:'magnetic',title:'Magnetic',category:'Listening',rarity:'Rare',maxLevel:1,ruleVersion:1,metadata:{}},
-  // Track identity deliberately remains inactive until a future phase can
-  // prove MusicBrainz recording identity without title-only matching.
-  {key:'i_cant_stop_me',title:"I CAN'T STOP ME",category:'Listening',rarity:'Epic',maxLevel:1,ruleVersion:1,enabled:false,metadata:{}}
+  {key:'i_cant_stop_me',title:"I CAN'T STOP ME",category:'Listening',rarity:'Epic',maxLevel:1,ruleVersion:2,metadata:{}},
+  {key:'album_run',title:'Album Run',category:'Listening',rarity:'Epic',maxLevel:1,ruleVersion:1,metadata:{}},
+  {key:'dash',title:'DASH',category:'Listening',rarity:'Legendary',maxLevel:1,ruleVersion:1,metadata:{}},
+  {key:'deja_vu',title:'Déjà Vu',category:'Listening',rarity:'Epic',maxLevel:1,ruleVersion:1,metadata:{}}
 ];
 
 function nextProgress(levels, value) {
@@ -62,6 +64,27 @@ function evaluate(input={}) {
   const strongest=magnetic.reduce((best,row)=>!best||row.streak.length>best.streak.length?row:best,null);
   progress.push({key:'magnetic',currentLevel:0,currentValue:strongest?.streak.length||0,targetValue:7});
   for(const row of magnetic) if(row.streak.length>=7&&Number(row.streak_scrobbles||0)>=14) candidates.push(candidate('magnetic',1,{release_group:{id:row.release_group_id,mbid:row.musicbrainz_release_group_mbid||null,title:row.display_title||'',artist:row.artist_name||'',artwork:row.artwork||null},local_days:row.streak,streak_scrobbles:Number(row.streak_scrobbles),streak_length:row.streak.length}));
+  const window=Intelligence.rollingTrackWindow(input.tracks||[]);
+  const maxTrackCount=(input.trackCounts||[]).reduce((n,row)=>Math.max(n,Number(row.scrobble_count||0)),0);
+  progress.push({key:'i_cant_stop_me',currentLevel:0,currentValue:window?10:Math.min(9,maxTrackCount),targetValue:10});
+  if(window) {
+    const track=input.trackById?.[window[0].track_id]||{};
+    candidates.push(candidate('i_cant_stop_me',1,{track:{id:window[0].track_id,mbid:track.musicbrainz_recording_mbid||null,title:track.display_title||window[0].source_track||'',artist:track.artist_name||window[0].source_artist||''},timestamps:window.map(x=>x.played_at),window_start:window[0].played_at,window_end:window.at(-1).played_at,timezone:input.timezone||'UTC'}));
+  }
+  const runs=input.albumRuns||[];
+  progress.push({key:'album_run',currentLevel:0,currentValue:runs.length?1:0,targetValue:1});
+  progress.push({key:'dash',currentLevel:0,currentValue:runs.some(x=>x.qualifies_dash)?1:0,targetValue:1});
+  const runSnapshot=run=>({release_group:run.release_group,release_id:run.release_id,tracks:run.track_timestamps,start:run.started_at,end:run.ended_at,elapsed_ms:Number(run.elapsed_ms),album_duration_ms:Number(run.total_duration_ms),foreign_scrobbles:Number(run.foreign_scrobble_count),inferred_start:Boolean(run.inferred_start),tracklist_evidence:run.tracklist_evidence||null,session_evidence:run.session_evidence||null});
+  for(const run of runs) {
+    candidates.push(candidate('album_run',1,runSnapshot(run)));
+    if(run.qualifies_dash) candidates.push(candidate('dash',1,runSnapshot(run)));
+  }
+  const byAlbumDay=new Map();
+  for(const run of runs) { const key=`${run.release_group_id}|${run.local_date}`; if(!byAlbumDay.has(key))byAlbumDay.set(key,[]); byAlbumDay.get(key).push(run); }
+  let bestPair=null;
+  for(const grouped of byAlbumDay.values()) if(grouped.length>=2) { grouped.sort((a,b)=>Date.parse(a.started_at)-Date.parse(b.started_at)); bestPair=grouped.slice(0,2); break; }
+  progress.push({key:'deja_vu',currentLevel:0,currentValue:bestPair?2:Math.min(1,runs.length),targetValue:2});
+  if(bestPair) candidates.push(candidate('deja_vu',1,{release_group:bestPair[0].release_group,local_date:bestPair[0].local_date,runs:bestPair.map(runSnapshot),timezone:input.timezone||'UTC'}));
   return {candidates,progress};
 }
 

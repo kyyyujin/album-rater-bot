@@ -7,6 +7,7 @@ const puppeteer = require('puppeteer');
 const { Client, GatewayIntentBits, REST, Routes, SlashCommandBuilder, EmbedBuilder } = require('discord.js');
 const AchievementRules = require('./achievement-rules');
 const ListeningRules = require('./listening-rules');
+const ListeningIntelligence = require('./listening-intelligence');
 const { normalizeIanaTimezone, localListeningParts } = require('./timezone-utils');
 
 const app    = express();
@@ -1305,19 +1306,221 @@ function resolveListeningIdentity(track, index) {
   else if(artist && sourceAlbum) { const exact=index.groupsByArtistTitle.get(`${artist.id}|${AchievementRules.normText(sourceAlbum)}`)||[]; if(exact.length===1) { group=exact[0]; source='existing_canonical_release_group_exact'; confidence=.95; } else if(exact.length>1) return {artist,group:null,source:'ambiguous_release_group',confidence:null}; }
   return {artist,group,source:source||'unresolved',confidence};
 }
+
+// ── Phase 3A: asynchronous recording/release-track enrichment ─────────────
+// Last.fm album MBIDs identify MusicBrainz releases, not release groups. The
+// Phase 3 worker follows that relation explicitly and never treats a title as
+// canonical identity unless it is an exact, unique match inside a verified
+// MusicBrainz release tracklist.
+async function fetchMusicBrainzRelease(releaseMbid) {
+  return mbJson(`/release/${releaseMbid}?inc=release-groups+artists+artist-credits+recordings`);
+}
+async function ensureListeningArtist(scrobble) {
+  if(scrobble.artist_id) return (await sb(`music_artists?id=eq.${scrobble.artist_id}&limit=1`))?.[0]||null;
+  const mbid=safeMbId(scrobble.source_artist_mbid);
+  if(mbid) {
+    const existing=(await sb(`music_artists?musicbrainz_artist_mbid=eq.${mbid}&limit=1`))?.[0];
+    if(existing) return existing;
+    const artist=await mbJson(`/artist/${mbid}`);
+    if(identityText(artist?.name)!==identityText(scrobble.source_artist)) throw Object.assign(new Error('artist MBID/name conflict'),{resolution:'ambiguous_artist_mbid_name_conflict'});
+    return upsertCanonicalArtist({id:mbid,name:artist.name},'lastfm_artist_mbid_validated');
+  }
+  const rows=await sb(`music_artists?normalized_name=eq.${encodeURIComponent(identityText(scrobble.source_artist))}&limit=3`);
+  if(rows?.length===1) return rows[0];
+  if(rows?.length>1) throw Object.assign(new Error('ambiguous exact artist'),{resolution:'ambiguous_artist'});
+  return null;
+}
+async function upsertMusicRelease(release, groupRow, groupArtist) {
+  const releaseMbid=safeMbId(release?.id); if(!releaseMbid) throw new Error('release MBID missing');
+  const tracklist=ListeningIntelligence.flattenReleaseTracklist(release);
+  const title=String(release?.title||'').trim();
+  const releaseRows=await sb('music_releases?on_conflict=musicbrainz_release_mbid',{method:'POST',headers:{Prefer:'resolution=merge-duplicates,return=representation'},body:JSON.stringify({release_group_id:groupRow.id,musicbrainz_release_mbid:releaseMbid,display_title:title,normalized_title:identityText(title),release_date:mbDate(release?.date),country:release?.country||null,status:release?.status||null,packaging:release?.packaging||null,media_formats:(release?.media||[]).map(x=>x?.format).filter(Boolean),tracklist_status:tracklist.status,duration_complete:tracklist.duration_complete,total_duration_ms:tracklist.total_duration_ms,source:'musicbrainz_release_lookup',match_confidence:1,metadata:{musicbrainz:true,medium_count:(release?.media||[]).length},updated_at:new Date().toISOString()})});
+  const releaseRow=releaseRows?.[0]; if(!releaseRow) throw new Error('release upsert failed');
+  const persisted=[];
+  for(const item of tracklist.tracks) {
+    if(!safeMbId(item.recording_mbid)||!safeMbId(item.track_mbid)) continue;
+    const recordingCredit=(item.artist_credit||[]).map(x=>x?.artist).filter(Boolean);
+    const singleCredit=recordingCredit.length===1?safeMbId(recordingCredit[0]?.id):null;
+    const recordingArtistId=singleCredit&&singleCredit===safeMbId(groupArtist?.musicbrainz_artist_mbid)?groupArtist.id:null;
+    const trackRows=await sb('music_tracks?on_conflict=musicbrainz_recording_mbid',{method:'POST',headers:{Prefer:'resolution=merge-duplicates,return=representation'},body:JSON.stringify({display_title:item.title,normalized_title:identityText(item.title),artist_id:recordingArtistId,artist_credit:item.artist_credit||[],musicbrainz_recording_mbid:item.recording_mbid,duration_ms:item.duration_ms,duration_source:item.duration_ms?'musicbrainz_release_track':null,duration_confidence:item.duration_ms?1:null,source:'musicbrainz_recording',match_confidence:1,metadata:{musicbrainz:true},updated_at:new Date().toISOString()})});
+    const trackRow=trackRows?.[0]; if(!trackRow) continue;
+    const releaseTrackRows=await sb('music_release_tracks?on_conflict=musicbrainz_track_mbid',{method:'POST',headers:{Prefer:'resolution=merge-duplicates,return=representation'},body:JSON.stringify({release_id:releaseRow.id,track_id:trackRow.id,musicbrainz_track_mbid:item.track_mbid,display_title:item.title,normalized_title:identityText(item.title),medium_position:item.medium_position,track_position:item.position,absolute_position:item.absolute_position,duration_ms:item.duration_ms,duration_source:item.duration_ms?'musicbrainz_release_track':null,duration_confidence:item.duration_ms?1:null,source:'musicbrainz_release_track',match_confidence:1,metadata:{recording_mbid:item.recording_mbid},updated_at:new Date().toISOString()})});
+    if(releaseTrackRows?.[0]) persisted.push({...releaseTrackRows[0],musicbrainz_recording_mbid:item.recording_mbid});
+  }
+  return {release:releaseRow,tracklist:{...tracklist,tracks:persisted}};
+}
+async function ensureReleaseGroupForRelease(release, artistHint) {
+  let group=release?.['release-group'];
+  const groupMbid=safeMbId(group?.id); if(!groupMbid) throw Object.assign(new Error('release lacks release group'),{resolution:'release_without_release_group'});
+  if(!group?.['artist-credit']) group=await mbJson(`/release-group/${groupMbid}?inc=artists`);
+  const credit=mbArtistCredit(group)||mbArtistCredit(release);
+  if(!credit) throw Object.assign(new Error('ambiguous release artist credit'),{resolution:'ambiguous_release_artist_credit'});
+  if(artistHint&&safeMbId(artistHint.musicbrainz_artist_mbid)!==credit.mbid) throw Object.assign(new Error('album/artist conflict'),{resolution:'ambiguous_album_artist_conflict'});
+  const artist=artistHint||await upsertCanonicalArtist({id:credit.mbid,name:credit.name},'musicbrainz_release_credit');
+  const groupRow=await upsertCanonicalReleaseGroup(group,artist,'musicbrainz_release_relation',1);
+  return {groupRow,artist};
+}
+async function ensureObservedRelease(scrobble, artistHint) {
+  const releaseMbid=safeMbId(scrobble.source_album_mbid); if(!releaseMbid) return null;
+  const cached=(await sb(`music_releases?musicbrainz_release_mbid=eq.${releaseMbid}&limit=1`))?.[0];
+  if(cached) {
+    const group=(await sb(`music_release_groups?id=eq.${cached.release_group_id}&limit=1`))?.[0];
+    const artist=group?(await sb(`music_artists?id=eq.${group.artist_id}&limit=1`))?.[0]:artistHint;
+    const tracks=await sb(`music_release_tracks?release_id=eq.${cached.id}&order=absolute_position.asc`);
+    return {release:cached,groupRow:group,artist,tracks:tracks||[]};
+  }
+  const release=await fetchMusicBrainzRelease(releaseMbid);
+  const {groupRow,artist}=await ensureReleaseGroupForRelease(release,artistHint);
+  const persisted=await upsertMusicRelease(release,groupRow,artist);
+  return {release:persisted.release,groupRow,artist,tracks:persisted.tracklist.tracks};
+}
+async function ensureStrictListeningGroup(scrobble, artistHint) {
+  const found=await findStrictReleaseGroup({title:scrobble.source_album,artist:scrobble.source_artist});
+  if(found.status!=='resolved') throw Object.assign(new Error(found.note||'album unresolved'),{resolution:found.status==='ambiguous'?'ambiguous_release_group':'musicbrainz_no_unequivocal_album_match',retry:found.status!=='ambiguous'});
+  const credit=mbArtistCredit(found.group); if(!credit) throw Object.assign(new Error('ambiguous group credit'),{resolution:'ambiguous_release_artist_credit'});
+  if(artistHint&&safeMbId(artistHint.musicbrainz_artist_mbid)!==credit.mbid) throw Object.assign(new Error('group artist conflict'),{resolution:'ambiguous_album_artist_conflict'});
+  const artist=artistHint||await upsertCanonicalArtist({id:credit.mbid,name:credit.name},'musicbrainz_strict_exact_metadata');
+  return {groupRow:await upsertCanonicalReleaseGroup(found.group,artist,found.source,found.confidence),artist};
+}
+async function ensureRepresentativeRelease(groupRow, artist, observed) {
+  const current=(await sb(`music_release_group_representatives?release_group_id=eq.${groupRow.id}&limit=1`))?.[0];
+  if(current) {
+    const release=(await sb(`music_releases?id=eq.${current.release_id}&limit=1`))?.[0];
+    const tracks=release?await sb(`music_release_tracks?release_id=eq.${release.id}&order=absolute_position.asc`):[];
+    if(release?.tracklist_status==='complete') return {release,tracks:tracks||[],evidence:current.selection_evidence};
+  }
+  const mbid=safeMbId(groupRow.musicbrainz_release_group_mbid);
+  const data=await mbJson(`/release?release-group=${mbid}&limit=100&inc=media`);
+  const candidates=data?.releases||[];
+  if(observed&&!candidates.some(x=>safeMbId(x.id)===safeMbId(observed.release?.musicbrainz_release_mbid))) candidates.push({id:observed.release.musicbrainz_release_mbid,title:observed.release.display_title,status:observed.release.status,date:observed.release.release_date,media:(observed.release.media_formats||[]).map(format=>({format}))});
+  const chosen=ListeningIntelligence.chooseRepresentativeRelease(candidates,{title:groupRow.display_title,first_release_date:groupRow.first_release_date});
+  if(!chosen) throw Object.assign(new Error('no representative release'),{resolution:'representative_release_unavailable',retry:true});
+  let detailed;
+  if(observed&&safeMbId(observed.release?.musicbrainz_release_mbid)===safeMbId(chosen.release.id)&&observed.tracks?.length) detailed={release:observed.release,tracklist:{tracks:observed.tracks,status:observed.release.tracklist_status,duration_complete:observed.release.duration_complete,total_duration_ms:observed.release.total_duration_ms}};
+  else detailed=await upsertMusicRelease(await fetchMusicBrainzRelease(chosen.release.id),groupRow,artist);
+  const rows=await sb('music_release_group_representatives?on_conflict=release_group_id',{method:'POST',headers:{Prefer:'resolution=merge-duplicates,return=representation'},body:JSON.stringify({release_group_id:groupRow.id,release_id:detailed.release.id,selection_version:ListeningIntelligence.VERSION,selection_source:'musicbrainz_ranked_release_candidates',selection_evidence:chosen.evidence,selected_at:new Date().toISOString(),updated_at:new Date().toISOString()})});
+  return {release:detailed.release,tracks:detailed.tracklist.tracks||[],evidence:rows?.[0]?.selection_evidence||chosen.evidence};
+}
+async function finishEnrichmentJob(job,status,reason,error=null,retryMs=null) {
+  const body={status,locked_until:null,resolution_reason:reason||null,last_error:error?String(error.message||error).slice(0,300):null,updated_at:new Date().toISOString()};
+  if(retryMs) body.next_attempt_at=new Date(Date.now()+retryMs).toISOString();
+  await sb(`listening_enrichment_jobs?scrobble_id=eq.${job.scrobble_id}`,{method:'PATCH',headers:{Prefer:'return=minimal'},body:JSON.stringify(body)});
+}
+async function enrichListeningScrobble(job) {
+  const scrobble=(await sb(`listening_scrobbles?id=eq.${job.scrobble_id}&limit=1`))?.[0]; if(!scrobble) return null;
+  try {
+    let artist=await ensureListeningArtist(scrobble), observed=null, groupRow=null;
+    if(scrobble.source_album_mbid) { observed=await ensureObservedRelease(scrobble,artist); groupRow=observed?.groupRow; artist=observed?.artist||artist; }
+    else if(scrobble.source_album) { const strict=await ensureStrictListeningGroup(scrobble,artist); groupRow=strict.groupRow; artist=strict.artist; }
+    if(!groupRow) throw Object.assign(new Error('album missing'),{resolution:scrobble.source_album?'release_group_unresolved':'missing_album'});
+    const representative=await ensureRepresentativeRelease(groupRow,artist,observed);
+    const sourceTrackMbid=safeMbId(scrobble.source_track_mbid);
+    let match=null;
+    if(sourceTrackMbid) {
+      const canonical=(await sb(`music_tracks?musicbrainz_recording_mbid=eq.${sourceTrackMbid}&limit=1`))?.[0];
+      if(canonical) {
+        const links=representative.tracks.filter(x=>x.track_id===canonical.id);
+        if(links.length===1) match={status:'resolved',track:links[0]};
+      }
+    }
+    if(!match) match=ListeningIntelligence.exactReleaseTrackMatch(scrobble.source_track,representative.tracks);
+    if(match.status!=='resolved'&&observed?.tracks?.length) match=ListeningIntelligence.exactReleaseTrackMatch(scrobble.source_track,observed.tracks);
+    const releaseTrack=match.status==='resolved'?match.track:null;
+    const track=releaseTrack?(await sb(`music_tracks?id=eq.${releaseTrack.track_id}&limit=1`))?.[0]:null;
+    const status=track?'resolved':match.status;
+    const reason=track?'musicbrainz_release_track_exact':match.reason;
+    await sb('rpc/listening_reconcile_scrobble_identity',{method:'POST',body:JSON.stringify({p_scrobble_id:scrobble.id,p_artist_id:artist?.id||null,p_release_group_id:groupRow.id,p_track_id:track?.id||null,p_release_track_id:releaseTrack?.id||null,p_status:status,p_reason:reason,p_match_source:track?'musicbrainz_release_track_exact':'musicbrainz_release_resolved_track_unresolved',p_match_confidence:track?1:.9,p_metadata:{release_mbid:observed?.release?.musicbrainz_release_mbid||null,representative_release_id:representative.release.id,representative_evidence:representative.evidence}})});
+    await finishEnrichmentJob(job,status,reason);
+    return {...scrobble,artist_id:artist?.id||null,release_group_id:groupRow.id,track_id:track?.id||null,release_track_id:releaseTrack?.id||null,enrichment_status:status};
+  } catch(error) {
+    const reason=error.resolution||(/MusicBrainz (429|5\d\d)/.test(error.message)?'musicbrainz_temporary_error':'enrichment_error');
+    const retry=error.retry||/MusicBrainz (429|5\d\d)/.test(error.message);
+    const status=retry?'retry':String(reason).startsWith('ambiguous')?'ambiguous':'unresolved';
+    const delay=retry?(reason==='musicbrainz_no_unequivocal_album_match'?14*86400000:Math.min(24*3600000,15*60000*(2**Math.min(6,Number(job.attempts||1)-1)))):null;
+    await sb('rpc/listening_reconcile_scrobble_identity',{method:'POST',body:JSON.stringify({p_scrobble_id:scrobble.id,p_artist_id:scrobble.artist_id,p_release_group_id:scrobble.release_group_id,p_track_id:scrobble.track_id,p_release_track_id:scrobble.release_track_id,p_status:status,p_reason:reason,p_match_source:scrobble.match_source,p_match_confidence:scrobble.match_confidence,p_metadata:{last_error:String(error.message||error).slice(0,160)}})}).catch(()=>{});
+    await finishEnrichmentJob(job,status,reason,error,delay);
+    return {...scrobble,enrichment_status:status,enrichment_reason:reason};
+  }
+}
+async function projectTrackBursts(username,trackIds,timezone) {
+  for(const trackId of new Set((trackIds||[]).filter(Boolean))) {
+    const rows=await sb(`listening_scrobbles?user_id=eq.${encodeURIComponent(username)}&track_id=eq.${trackId}&select=id,track_id,played_at&order=played_at.asc&limit=10000`);
+    const window=ListeningIntelligence.rollingTrackWindow(rows||[]); if(!window) continue;
+    await sb('listening_track_bursts?on_conflict=user_id,track_id,window_start',{method:'POST',headers:{Prefer:'resolution=ignore-duplicates,return=minimal'},body:JSON.stringify({user_id:username,track_id:trackId,window_start:window[0].played_at,window_end:window.at(-1).played_at,scrobble_ids:window.map(x=>x.id),timestamps:window.map(x=>x.played_at),timezone,projection_version:ListeningIntelligence.VERSION})});
+  }
+}
+async function rebuildListeningProjections(username,affectedRows) {
+  const dated=(affectedRows||[]).filter(x=>Number.isFinite(Date.parse(x.played_at))); if(!dated.length) return {sessions:0,runs:0};
+  const epoch=await getActiveLastfmEpoch(username); if(!epoch) return {sessions:0,runs:0};
+  const from=new Date(Math.min(...dated.map(x=>Date.parse(x.played_at)))-36*3600000).toISOString();
+  const [rows,coverage]=await Promise.all([
+    sb(`listening_scrobbles?user_id=eq.${encodeURIComponent(username)}&played_at=gte.${encodeURIComponent(from)}&select=id,epoch_id,artist_id,release_group_id,track_id,source_artist,source_track,played_at,local_date&order=played_at.asc&limit=5000`),
+    sb(`listening_coverage_windows?user_id=eq.${encodeURIComponent(username)}&coverage_end=gte.${encodeURIComponent(from)}&select=coverage_start,coverage_end,status`)
+  ]);
+  const groupIds=[...new Set((rows||[]).map(x=>x.release_group_id).filter(Boolean))];
+  const representatives=groupIds.length?await sb(`music_release_group_representatives?release_group_id=in.(${groupIds.join(',')})&select=release_group_id,release_id,selection_version,selection_evidence`):[];
+  const releaseIds=(representatives||[]).map(x=>x.release_id);
+  const releases=releaseIds.length?await sb(`music_releases?id=in.(${releaseIds.join(',')})&select=id,release_group_id,tracklist_status,duration_complete,total_duration_ms,display_title`):[];
+  const releaseTracks=releaseIds.length?await sb(`music_release_tracks?release_id=in.(${releaseIds.join(',')})&select=id,release_id,track_id,absolute_position,duration_ms,display_title&order=absolute_position.asc`):[];
+  const repByGroup=new Map((representatives||[]).map(x=>[x.release_group_id,x])), releaseById=new Map((releases||[]).map(x=>[x.id,x])), tracksByRelease=new Map();
+  for(const item of releaseTracks||[]) { if(!tracksByRelease.has(item.release_id))tracksByRelease.set(item.release_id,[]); tracksByRelease.get(item.release_id).push(item); }
+  const tracklists={};
+  for(const groupId of groupIds) { const rep=repByGroup.get(groupId), release=rep&&releaseById.get(rep.release_id), tracks=release?tracksByRelease.get(release.id)||[]:[]; if(release) tracklists[groupId]={release_id:release.id,status:release.tracklist_status,duration_complete:release.duration_complete,total_duration_ms:Number(release.total_duration_ms),tracks,evidence:rep.selection_evidence}; }
+  const projected=(rows||[]).map(row=>{ const list=tracklists[row.release_group_id], matches=list?.tracks?.filter(x=>x.track_id===row.track_id)||[], link=matches.length===1?matches[0]:null; return {...row,representative_position:link?.absolute_position||null,duration_ms:link?.duration_ms||null}; });
+  const sessions=ListeningIntelligence.buildSessions(projected,coverage||[]);
+  const runs=ListeningIntelligence.detectAlbumRuns(projected,tracklists,coverage||[]);
+  await sb(`listening_session_items?session_id=in.(${(await sb(`listening_sessions?user_id=eq.${encodeURIComponent(username)}&started_at=gte.${encodeURIComponent(from)}&select=id`)).map(x=>x.id).join(',')||'00000000-0000-0000-0000-000000000000'})`,{method:'DELETE',headers:{Prefer:'return=minimal'}}).catch(()=>{});
+  await sb(`listening_sessions?user_id=eq.${encodeURIComponent(username)}&started_at=gte.${encodeURIComponent(from)}`,{method:'DELETE',headers:{Prefer:'return=minimal'}});
+  await sb(`listening_album_runs?user_id=eq.${encodeURIComponent(username)}&started_at=gte.${encodeURIComponent(from)}`,{method:'DELETE',headers:{Prefer:'return=minimal'}});
+  for(const session of sessions) {
+    const fingerprint=sha256([username,...session.items.map(x=>x.id),ListeningIntelligence.VERSION].join('|'));
+    const inserted=await sb('listening_sessions?on_conflict=user_id,session_fingerprint',{method:'POST',headers:{Prefer:'resolution=merge-duplicates,return=representation'},body:JSON.stringify({user_id:username,epoch_id:session.items[0].epoch_id,started_at:session.started_at,ended_at:session.ended_at,started_at_is_derived:session.started_at_is_derived,item_count:session.items.length,identity_status:session.identity_status,duration_status:session.duration_status,coverage_status:session.coverage_status,projection_version:ListeningIntelligence.VERSION,session_fingerprint:fingerprint,metadata:{algorithm:'projected-silence-v1'}})});
+    const sessionId=inserted?.[0]?.id;
+    if(sessionId) await sb('listening_session_items',{
+      method:'POST',headers:{Prefer:'return=minimal'},
+      body:JSON.stringify(session.items.map((x,i)=>({session_id:sessionId,scrobble_id:x.id,item_position:i+1,projected_start_at:Number(x.duration_ms)>0?new Date(Date.parse(x.played_at)-Number(x.duration_ms)).toISOString():null})))
+    });
+  }
+  const groups=groupIds.length?await sb(`music_release_groups?id=in.(${groupIds.join(',')})&select=id,display_title,musicbrainz_release_group_mbid,music_artists(display_name)`):[];
+  const groupById=new Map((groups||[]).map(x=>[x.id,x]));
+  for(const run of runs) {
+    const group=groupById.get(run.release_group_id)||{};
+    const fingerprint=sha256([username,run.release_group_id,...run.scrobble_ids,ListeningIntelligence.VERSION].join('|'));
+    const tracklist=tracklists[run.release_group_id];
+    const evidence={...run,release_group:{id:run.release_group_id,mbid:group.musicbrainz_release_group_mbid||null,title:group.display_title||'',artist:group.music_artists?.display_name||''},tracklist_evidence:tracklist?.evidence||null,session_evidence:{algorithm:'projected-silence-v1',coverage:'covered'}};
+    await sb('listening_album_runs?on_conflict=user_id,run_fingerprint',{method:'POST',headers:{Prefer:'resolution=merge-duplicates,return=minimal'},body:JSON.stringify({user_id:username,epoch_id:epoch.id,release_group_id:run.release_group_id,release_id:run.release_id,local_date:run.local_date,started_at:run.started_at,ended_at:run.ended_at,inferred_start:run.inferred_start,elapsed_ms:run.elapsed_ms,album_duration_ms:run.total_duration_ms,track_count:run.track_count,foreign_scrobble_count:run.foreign_scrobble_count,qualifies_dash:run.qualifies_dash,run_fingerprint:fingerprint,evidence,projection_version:ListeningIntelligence.VERSION})});
+  }
+  await projectTrackBursts(username,dated.map(x=>x.track_id),epoch.timezone);
+  return {sessions:sessions.length,runs:runs.length};
+}
+async function runListeningEnrichmentBatch(limit=3) {
+  const jobs=await sb('rpc/claim_listening_enrichment_jobs',{method:'POST',body:JSON.stringify({p_limit:limit})});
+  const affectedByUser=new Map(), results=[];
+  for(const job of jobs||[]) {
+    const result=await enrichListeningScrobble(job); results.push(result);
+    if(result) { if(!affectedByUser.has(result.user_id))affectedByUser.set(result.user_id,[]); affectedByUser.get(result.user_id).push(result); }
+  }
+  const projections=[];
+  for(const [username,rows] of affectedByUser) { projections.push({user_id:username,...await rebuildListeningProjections(username,rows)}); await evaluateListeningAchievements(username,'listening_enrichment'); }
+  return {processed:results.length,resolved:results.filter(x=>x?.enrichment_status==='resolved').length,projections};
+}
 function overlapCoverage(rows,start,end) {
   const intervals=(rows||[]).filter(x=>x.status==='covered'&&Date.parse(x.coverage_end)>start&&Date.parse(x.coverage_start)<end).map(x=>[Math.max(start,Date.parse(x.coverage_start)),Math.min(end,Date.parse(x.coverage_end))]).sort((a,b)=>a[0]-b[0]);
   let total=0,last=null; for(const range of intervals){ if(!last||range[0]>last[1]) { if(last) total+=last[1]-last[0]; last=[...range]; } else last[1]=Math.max(last[1],range[1]); } if(last) total+=last[1]-last[0]; return Math.max(0,Math.min(1,total/Math.max(1,end-start)));
 }
 async function listeningEvaluationInput(username) {
   const now=Date.now(), sevenDays=now-7*86400000;
-  const [artists,releases,hours,dailyReleases,coverage,recent]=await Promise.all([
+  const [artists,releases,hours,dailyReleases,coverage,recent,trackCounts,bursts,albumRuns,epoch]=await Promise.all([
     sb(`listening_lifetime_artist_counts?user_id=eq.${encodeURIComponent(username)}&select=artist_id,scrobble_count,music_artists!inner(display_name,musicbrainz_artist_mbid)&order=scrobble_count.desc&limit=100`),
     sb(`listening_lifetime_release_group_counts?user_id=eq.${encodeURIComponent(username)}&select=release_group_id,scrobble_count,music_release_groups!inner(display_title,musicbrainz_release_group_mbid,music_artists!inner(display_name))&order=scrobble_count.desc&limit=100`),
     sb(`listening_hour_totals?user_id=eq.${encodeURIComponent(username)}&local_hour=lt.5&select=local_date,local_hour,scrobble_count`),
     sb(`listening_daily_release_group_counts?user_id=eq.${encodeURIComponent(username)}&select=local_date,release_group_id,scrobble_count,music_release_groups!inner(display_title,musicbrainz_release_group_mbid,music_artists!inner(display_name))&order=local_date.asc&limit=5000`),
     sb(`listening_coverage_windows?user_id=eq.${encodeURIComponent(username)}&select=coverage_start,coverage_end,status`),
-    sb(`listening_scrobbles?user_id=eq.${encodeURIComponent(username)}&played_at=gte.${encodeURIComponent(new Date(sevenDays).toISOString())}&select=played_at,release_group_id&order=played_at.asc&limit=5000`)
+    sb(`listening_scrobbles?user_id=eq.${encodeURIComponent(username)}&played_at=gte.${encodeURIComponent(new Date(sevenDays).toISOString())}&select=played_at,release_group_id&order=played_at.asc&limit=5000`),
+    sb(`listening_lifetime_track_counts?user_id=eq.${encodeURIComponent(username)}&select=track_id,scrobble_count,music_tracks!inner(display_title,musicbrainz_recording_mbid,music_artists(display_name))&order=scrobble_count.desc&limit=100`),
+    sb(`listening_track_bursts?user_id=eq.${encodeURIComponent(username)}&select=track_id,timestamps,window_start,window_end&order=window_start.asc&limit=20`),
+    sb(`listening_album_runs?user_id=eq.${encodeURIComponent(username)}&select=release_group_id,release_id,local_date,started_at,ended_at,elapsed_ms,album_duration_ms,foreign_scrobble_count,qualifies_dash,evidence&order=started_at.asc&limit=200`),
+    getActiveLastfmEpoch(username)
   ]);
   const artistRows=(artists||[]).map(x=>({...x,...(x.music_artists||{})}));
   const releaseRows=(releases||[]).map(x=>({...x,...(x.music_release_groups||{}),artist_name:x.music_release_groups?.music_artists?.display_name||''}));
@@ -1326,15 +1529,20 @@ async function listeningEvaluationInput(username) {
   const magnetic=[...byRelease.values()].map(row=>{ const streak=ListeningRules.maxConsecutive(row.days); return {...row,streak_scrobbles:streak.reduce((n,d)=>n+(row.counts.get(d)||0),0)}; });
   const coveragePercent=overlapCoverage(coverage,sevenDays,now), byRecentRelease=new Map(); for(const row of recent||[]) if(row.release_group_id) byRecentRelease.set(row.release_group_id,(byRecentRelease.get(row.release_group_id)||0)+1);
   const totalRecent=(recent||[]).length; let hyperfixation=null; for(const [release_group_id,album_count] of byRecentRelease){ if(!hyperfixation||album_count>hyperfixation.album_count){ const r=releaseRows.find(x=>x.release_group_id===release_group_id)||{}; hyperfixation={release_group:{id:release_group_id,mbid:r.musicbrainz_release_group_mbid||null,title:r.display_title||'',artist:r.artist_name||''},release_group_id,album_count,total:totalRecent,coverage:coveragePercent,window_start:new Date(sevenDays).toISOString(),window_end:new Date(now).toISOString()}; } }
-  return {artists:artistRows,releaseGroups:releaseRows,lucidDream:lucid,magnetic,hyperfixation};
+  const trackRows=(trackCounts||[]).map(x=>({...x,...(x.music_tracks||{}),artist_name:x.music_tracks?.music_artists?.display_name||''}));
+  const trackById=Object.fromEntries(trackRows.map(x=>[x.track_id,x]));
+  const burstTracks=[]; for(const burst of bursts||[]) (burst.timestamps||[]).forEach((played_at,index)=>burstTracks.push({id:`${burst.track_id}:${index}:${played_at}`,track_id:burst.track_id,played_at}));
+  const runRows=(albumRuns||[]).map(row=>({...row,...(row.evidence||{}),total_duration_ms:Number(row.album_duration_ms),track_timestamps:row.evidence?.track_timestamps||row.evidence?.tracks||[]}));
+  return {artists:artistRows,releaseGroups:releaseRows,lucidDream:lucid,magnetic,hyperfixation,trackCounts:trackRows,trackById,tracks:burstTracks,albumRuns:runRows,timezone:epoch?.timezone||'UTC'};
 }
 async function refreshListeningRecords(username, input) {
-  const artist=(input.artists||[])[0], album=(input.releaseGroups||[])[0];
+  const artist=(input.artists||[])[0], album=(input.releaseGroups||[])[0], track=(input.trackCounts||[])[0];
   const hourRows=await sb(`listening_hour_totals?user_id=eq.${encodeURIComponent(username)}&select=local_hour,scrobble_count&order=scrobble_count.desc&limit=24`);
   const dominant=(hourRows||[]).sort((a,b)=>Number(b.scrobble_count)-Number(a.scrobble_count))[0];
   const now=new Date().toISOString(), rows=[];
   if(artist) rows.push({user_id:username,record_key:'most_played_artist',value:{artist:{id:artist.artist_id,name:artist.display_name,mbid:artist.musicbrainz_artist_mbid||null},scrobbles:Number(artist.scrobble_count)},observed_at:now,updated_at:now});
   if(album) rows.push({user_id:username,record_key:'most_played_album',value:{release_group:{id:album.release_group_id,title:album.display_title,artist:album.artist_name,mbid:album.musicbrainz_release_group_mbid||null},scrobbles:Number(album.scrobble_count)},observed_at:now,updated_at:now});
+  if(track) rows.push({user_id:username,record_key:'most_replayed_track',value:{track:{id:track.track_id,title:track.display_title,artist:track.artist_name,mbid:track.musicbrainz_recording_mbid||null},scrobbles:Number(track.scrobble_count)},observed_at:now,updated_at:now});
   if(dominant) rows.push({user_id:username,record_key:'dominant_listening_hour',value:{local_hour:Number(dominant.local_hour),scrobbles:Number(dominant.scrobble_count)},observed_at:now,updated_at:now});
   if(rows.length) await sb('vault_personal_records?on_conflict=user_id,record_key',{method:'POST',headers:{Prefer:'resolution=merge-duplicates,return=minimal'},body:JSON.stringify(rows)});
 }
@@ -1369,7 +1577,7 @@ async function syncLastfmEpoch(epoch, trigger='scheduler') {
         const fingerprint=lastfmFingerprint(epoch.id,track); if(collected.has(fingerprint)) continue;
         const identity=resolveListeningIdentity(track,index); if(!identity.group) { unresolved++; if(String(identity.source).startsWith('ambiguous')) ambiguous++; }
         const local=localListeningParts(played,epoch.timezone);
-        collected.set(fingerprint,{artist_id:identity.artist?.id||null,release_group_id:identity.group?.id||null,source_artist:lastfmTrackText(track,'artist'),source_album:lastfmTrackText(track,'album')||null,source_track:String(track?.name||'').trim(),source_artist_mbid:safeMbId(track?.artist?.mbid),source_album_mbid:safeMbId(track?.album?.mbid),played_at:new Date(played).toISOString(),local_date:local.local_date,local_hour:local.local_hour,source_fingerprint:fingerprint,match_confidence:identity.confidence,match_source:identity.source});
+        collected.set(fingerprint,{artist_id:identity.artist?.id||null,release_group_id:identity.group?.id||null,source_artist:lastfmTrackText(track,'artist'),source_album:lastfmTrackText(track,'album')||null,source_track:String(track?.name||'').trim(),source_artist_mbid:safeMbId(track?.artist?.mbid),source_album_mbid:safeMbId(track?.album?.mbid),source_track_mbid:safeMbId(track?.mbid),played_at:new Date(played).toISOString(),local_date:local.local_date,local_hour:local.local_hour,source_fingerprint:fingerprint,match_confidence:identity.confidence,match_source:identity.source});
       }
       if(oldest!==null&&oldest<=cutoff) { reached=true; break; }
       const totalPages=Number(data?.recenttracks?.['@attr']?.totalPages||1);
@@ -1380,6 +1588,7 @@ async function syncLastfmEpoch(epoch, trigger='scheduler') {
     const latestObserved=Math.max(before,...[...collected.values()].map(x=>Date.parse(x.played_at)).filter(Number.isFinite));
     const now=Date.now(), coverageUntil=reached&&now-LASTFM_OVERLAP_MS> Date.parse(epoch.coverage_cursor_at) ? new Date(now-LASTFM_OVERLAP_MS).toISOString() : null;
     const rows=await sb('rpc/lastfm_apply_sync_batch',{method:'POST',body:JSON.stringify({p_epoch_id:epoch.id,p_user_id:epoch.user_id,p_items:[...collected.values()],p_watermark:reached?new Date(latestObserved).toISOString():epoch.watermark_played_at,p_coverage_until:coverageUntil,p_backlog_cursor_before:reached?null:(backlogCursor?new Date(backlogCursor).toISOString():epoch.backlog_cursor_before||null)})});
+    await sb('rpc/listening_capture_source_track_mbids',{method:'POST',body:JSON.stringify({p_epoch_id:epoch.id,p_items:[...collected.values()]})});
     const inserted=Number(rows?.[0]?.inserted||0), duplicates=Math.max(0,collected.size-inserted);
     const unlocks=await evaluateListeningAchievements(epoch.user_id,'lastfm_sync');
     await syncRunPatch(runId,{completed_at:new Date().toISOString(),status:reached?'success':'backlog',pages,observed,inserted,duplicates,discarded_pre_tracking:discarded,unresolved,ambiguous,watermark_after:reached?new Date(latestObserved).toISOString():epoch.watermark_played_at,coverage_until:coverageUntil,lastfm_status:lastfmStatus,metadata:{trigger,backlog_pending:!reached}});
@@ -1405,6 +1614,8 @@ async function syncAllConfiguredLastfmUsers(trigger='scheduler') {
     const profile={...(row.vault_profile||{}),timezone:row.timezone||row.vault_profile?.timezone||'UTC'};
     try { results.push({user_id:row.username,...await syncConfiguredLastfmUser(row.username,trigger,profile)}); } catch(error) { results.push({user_id:row.username,status:'failed'}); }
   }
+  try { results.push({user_id:'system',status:'enrichment',...await runListeningEnrichmentBatch(3)}); }
+  catch(error) { console.warn('[listening enrichment]',error.message); results.push({user_id:'system',status:'enrichment_failed'}); }
   return results;
 }
 async function listeningTrackingReadModel(username) {
@@ -2162,6 +2373,14 @@ app.post('/internal/lastfm/sync', express.json({limit:'16kb'}), async (req,res) 
     const results=await syncAllConfiguredLastfmUsers('supabase_cron');
     res.json({ok:true,results:results.map(x=>({status:x.status,pages:x.pages||0,inserted:x.inserted||0}))});
   } catch(error) { console.error('[lastfm scheduler]',error.message); res.status(500).json({error:'Listening sync failed'}); }
+});
+app.post('/internal/listening/enrich', express.json({limit:'16kb'}), async (req,res) => {
+  try {
+    const config=(await sb('listening_scheduler_config?singleton=eq.true&select=scheduler_token&limit=1'))?.[0];
+    if(!config || !schedulerTokenMatches(req.get('x-album-vault-scheduler'),config.scheduler_token)) return res.status(403).json({error:'Forbidden'});
+    const result=await runListeningEnrichmentBatch(Math.max(1,Math.min(10,Number(req.body?.limit)||3)));
+    res.json({ok:true,...result});
+  } catch(error) { console.error('[listening enrichment endpoint]',error.message); res.status(500).json({error:'Listening enrichment failed'}); }
 });
 
 // Respuesta compacta y observable para cuerpos demasiado grandes. Sin este
