@@ -1370,7 +1370,10 @@ async function ensureObservedRelease(scrobble, artistHint) {
     return {release:cached,groupRow:group,artist,tracks:tracks||[]};
   }
   const release=await fetchMusicBrainzRelease(releaseMbid);
-  const {groupRow,artist}=await ensureReleaseGroupForRelease(release,artistHint);
+  // A verified Release MBID is stronger album evidence than Last.fm's artist
+  // MBID, which is frequently missing or points at a same-name artist. The
+  // release group's own artist credit is authoritative for album identity.
+  const {groupRow,artist}=await ensureReleaseGroupForRelease(release,null);
   const persisted=await upsertMusicRelease(release,groupRow,artist);
   return {release:persisted.release,groupRow,artist,tracks:persisted.tracklist.tracks};
 }
