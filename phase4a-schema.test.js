@@ -1,9 +1,11 @@
 'use strict';
 const assert=require('assert'),fs=require('fs'),path=require('path');
 const sql=fs.readFileSync(path.join(__dirname,'migrations/20260917063000_phase4a_discovery_secrets.sql'),'utf8').toLowerCase();
+const fkSql=fs.readFileSync(path.join(__dirname,'migrations/20260917064500_phase4a_discovery_fk_indexes.sql'),'utf8').toLowerCase();
 for(const required of ['is_discovery boolean','emblem_eligible boolean','coverage_continuous boolean','listening_discovery_artist_windows','discovery_love_dive_evidence','discovery_period_artist_segments','achievement_unlock_with_inbox','listening_scrobbles_user_epoch_time_idx','enable row level security','from public,anon,authenticated'])assert(sql.includes(required),`missing schema guarantee: ${required}`);
 assert(sql.includes("window_end=first_played_at+interval '30 days'"));
 assert(sql.includes('dense_rank() over'),'LOVE DIVE uses competition ranking with ties');
 assert(sql.includes('on conflict(user_id,achievement_key,level) do nothing'),'unlock RPC is concurrency-idempotent');
 assert(!sql.includes('update public.listening_scrobbles set played_at'),'raw timestamps must remain immutable');
+assert(fkSql.includes('listening_discovery_windows_epoch_idx')&&fkSql.includes('listening_discovery_windows_artist_idx'),'Discovery foreign keys are covered');
 console.log('Phase 4A schema tests passed');
