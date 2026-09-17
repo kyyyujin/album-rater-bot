@@ -39,11 +39,15 @@ function ranked(rows,idKey,meta={}) {
   const sorted=[...totals].sort((a,b)=>b[1]-a[1]||String(a[0]).localeCompare(String(b[0]))); let rank=0,last=null;
   return sorted.map(([id,count],index)=>{ if(count!==last)rank=index+1; last=count; return {id,count,rank,...(meta[id]||{})}; });
 }
-function buildSnapshot(spec,{dailyTotals=[],dailyReleases=[],dailyArtists=[],releaseMeta={},artistMeta={},coverageRatio=0,epochId}) {
+function buildSnapshot(spec,{dailyTotals=[],dailyReleases=[],dailyArtists=[],artistSegments=[],releaseMeta={},artistMeta={},coverageRatio=0,coverageContinuous=false,epochId}) {
   const inRange=row=>String(row.local_date)>=spec.local_start&&String(row.local_date)<spec.local_end;
   const scrobbleTotal=dailyTotals.filter(inRange).reduce((n,row)=>n+Number(row.scrobble_count||0),0);
   const completeness=spec.initial_partial?'partial':coverageRatio>=.9?'complete':'incomplete';
-  return {epoch_id:epochId,period_type:spec.period_type,local_start:spec.local_start,local_end:spec.local_end,utc_start:spec.utc_start,utc_end:spec.utc_end,timezone:spec.timezone,coverage_ratio:Math.round(coverageRatio*10000)/10000,completeness,scrobble_total:scrobbleTotal,rankings:{release_groups:ranked(dailyReleases.filter(inRange),'release_group_id',releaseMeta),artists:ranked(dailyArtists.filter(inRange),'artist_id',artistMeta)},snapshot_version:VERSION};
+  const segmentRows=(artistSegments||[]).filter(row=>row.metric_key===`${spec.period_type}:${spec.local_start}`);
+  const segmentRankings={};
+  for(const segment of ['day','night'])segmentRankings[segment]=ranked(segmentRows.filter(row=>row.segment===segment).map(row=>({...row,scrobble_count:row.scrobble_count??row.count})),'artist_id',artistMeta);
+  const unresolvedSegments=Object.fromEntries(['day','night'].map(segment=>[segment,segmentRows.filter(row=>row.segment===segment&&!row.artist_id).reduce((n,row)=>n+Number(row.scrobble_count??row.count??0),0)]));
+  return {epoch_id:epochId,period_type:spec.period_type,local_start:spec.local_start,local_end:spec.local_end,utc_start:spec.utc_start,utc_end:spec.utc_end,timezone:spec.timezone,coverage_ratio:Math.round(coverageRatio*10000)/10000,coverage_continuous:Boolean(coverageContinuous),completeness,scrobble_total:scrobbleTotal,rankings:{release_groups:ranked(dailyReleases.filter(inRange),'release_group_id',releaseMeta),artists:ranked(dailyArtists.filter(inRange),'artist_id',artistMeta),artist_segments:segmentRankings,artist_segment_unresolved:unresolvedSegments},snapshot_version:VERSION};
 }
 
 module.exports={DAY,VERSION,dateOnly,addDays,monthStart,nextMonth,weekStart,zonedDateToUtc,closedPeriodSpecs,ranked,buildSnapshot};

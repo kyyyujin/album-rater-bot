@@ -9,8 +9,9 @@ const AchievementRules = require('./achievement-rules');
 const ListeningRules = require('./listening-rules');
 const ListeningIntelligence = require('./listening-intelligence');
 const HybridRules = require('./hybrid-rules');
+const DiscoveryRules = require('./discovery-rules');
 const PeriodIntelligence = require('./period-intelligence');
-const { maskAchievementDefinitions } = require('./secret-visibility');
+const { achievementTrustBoundary } = require('./secret-visibility');
 const { normalizeIanaTimezone, localListeningParts } = require('./timezone-utils');
 const { classifyEnrichmentError, parseRetryAfter, retryDelayMs } = require('./enrichment-reliability');
 const { createSchedulerPipelines } = require('./scheduler-pipelines');
@@ -972,9 +973,10 @@ async function sb(path, options = {}) {
   return data;
 }
 let achievementDefinitionsReady = false;
+const ALL_ACHIEVEMENT_DEFINITIONS = [...AchievementRules.DEFINITIONS,...DiscoveryRules.DEFINITIONS];
 async function ensureAchievementDefinitions() {
   if (achievementDefinitionsReady) return;
-  const rows = AchievementRules.DEFINITIONS.map(d => ({ key:d.key,title:d.title,category:d.category,rarity:d.rarity,max_level:d.maxLevel,rule_version:d.ruleVersion,enabled:d.enabled!==false,is_secret:Boolean(d.metadata?.secret),client_metadata:{ badge:d.key, ...(d.metadata || {}) } }));
+  const rows = ALL_ACHIEVEMENT_DEFINITIONS.map(d => ({ key:d.key,title:d.title,category:d.category,rarity:d.rarity,max_level:d.maxLevel,rule_version:d.ruleVersion,enabled:d.enabled!==false,is_secret:Boolean(d.metadata?.secret),is_discovery:Boolean(d.metadata?.discovery),emblem_eligible:d.metadata?.emblemEligible!==false,client_metadata:{ badge:d.key, ...(d.metadata || {}) } }));
   await sb('vault_achievement_definitions?on_conflict=key', { method:'POST', headers:{ Prefer:'resolution=merge-duplicates,return=minimal' }, body:JSON.stringify(rows) });
   achievementDefinitionsReady = true;
 }
@@ -1012,15 +1014,14 @@ async function persistAchievementCandidates(username, candidates, source, occurr
   await ensureAchievementDefinitions();
   const unlocks=[];
   for (const c of candidates || []) {
-    const definition=AchievementRules.DEFINITIONS.find(d=>d.key===c.key && d.enabled!==false); if(!definition) continue;
+    const definition=ALL_ACHIEVEMENT_DEFINITIONS.find(d=>d.key===c.key && d.enabled!==false); if(!definition) continue;
     const levelRarity=definition.metadata?.levelRarities?.[c.level-1] || definition.rarity;
     // This object is the immutable Memory Card. Later profile, cover, rating or
     // canonical-metadata edits never patch an existing unlock snapshot.
     const snapshot={ ...c.snapshot, level_rarity:levelRarity, source, occurred_at:occurredAt, rule_version:definition.ruleVersion };
-    const inserted=await sb('vault_achievement_unlocks?on_conflict=user_id,achievement_key,level',{method:'POST',headers:{Prefer:'resolution=ignore-duplicates,return=representation'},body:JSON.stringify({user_id:username,achievement_key:c.key,level:c.level,unlocked_at:new Date().toISOString(),source,rule_version:definition.ruleVersion,snapshot})});
+    const inserted=await sb('rpc/achievement_unlock_with_inbox',{method:'POST',body:JSON.stringify({p_user_id:username,p_achievement_key:c.key,p_level:c.level,p_source:source,p_rule_version:definition.ruleVersion,p_snapshot:snapshot,p_unlocked_at:new Date().toISOString()})});
     if(Array.isArray(inserted)&&inserted[0]) {
       unlocks.push(inserted[0]);
-      await sb('vault_achievement_inbox',{method:'POST',headers:{Prefer:'resolution=ignore-duplicates,return=minimal'},body:JSON.stringify({user_id:username,unlock_id:inserted[0].id,source})});
     }
   }
   return unlocks;
@@ -1517,7 +1518,7 @@ async function runListeningEnrichmentBatch(limit=3) {
     if(result) { if(!affectedByUser.has(result.user_id))affectedByUser.set(result.user_id,[]); affectedByUser.get(result.user_id).push(result); }
   }
   const projections=[];
-  for(const [username,rows] of affectedByUser) { projections.push({user_id:username,...await rebuildListeningProjections(username,rows)}); await evaluateListeningAchievements(username,'listening_enrichment'); }
+  for(const [username,rows] of affectedByUser) { projections.push({user_id:username,...await rebuildListeningProjections(username,rows)}); await evaluateListeningAchievements(username,'listening_enrichment'); await evaluateDiscoveryListeningAchievements(username,'listening_enrichment'); }
   return {processed:results.length,resolved:results.filter(x=>x?.enrichment_status==='resolved').length,projections};
 }
 function overlapCoverage(rows,start,end) {
@@ -1651,6 +1652,48 @@ async function evaluateHybridAchievements(username,source='hybrid_reevaluation')
   await writeProgress(username,evaluation.progress);
   return persistAchievementCandidates(username,evaluation.candidates,source,new Date().toISOString());
 }
+async function discoveryGoneReturns(username,epoch) {
+  const ghosted=await sb(`vault_achievement_unlocks?user_id=eq.${encodeURIComponent(username)}&achievement_key=eq.ghosted&select=id,unlocked_at,snapshot&order=unlocked_at.asc&limit=10`);
+  const evidence=[];
+  for(const unlock of ghosted||[]) {
+    const releaseGroupId=unlock.snapshot?.release_group?.id, snapshotId=unlock.snapshot?.period_snapshot_id;
+    if(!releaseGroupId||!snapshotId||String(unlock.snapshot?.epoch_id||epoch.id)!==String(epoch.id))continue;
+    const period=(await sb(`listening_period_snapshots?id=eq.${snapshotId}&user_id=eq.${encodeURIComponent(username)}&epoch_id=eq.${epoch.id}&select=id,utc_end&limit=1`))?.[0];
+    if(!period)continue;
+    const plays=await sb(`listening_scrobbles?user_id=eq.${encodeURIComponent(username)}&epoch_id=eq.${epoch.id}&release_group_id=eq.${releaseGroupId}&played_at=gt.${encodeURIComponent(unlock.unlocked_at)}&select=id,played_at&order=played_at.asc&limit=100`);
+    const first=plays?.[0]; if(!first)continue;
+    const returnEnd=new Date(Date.parse(first.played_at)+14*86400000).toISOString(), qualifying=(plays||[]).filter(row=>Date.parse(row.played_at)<=Date.parse(returnEnd));
+    const coverage=(await sb('rpc/hybrid_coverage_evidence',{method:'POST',body:JSON.stringify({p_user_id:username,p_epoch_id:epoch.id,p_windows:[{key:unlock.id,start:period.utc_end,end:first.played_at}]})}))?.[0];
+    const group=(await sb(`music_release_groups?id=eq.${releaseGroupId}&select=id,display_title,musicbrainz_release_group_mbid,music_artists!inner(display_name)&limit=1`))?.[0];
+    evidence.push({canonical:Boolean(group?.musicbrainz_release_group_mbid),same_epoch:true,epoch_id:epoch.id,release_group:{id:group?.id,mbid:group?.musicbrainz_release_group_mbid,title:group?.display_title||'',artist:group?.music_artists?.display_name||''},ghosted_unlock_id:unlock.id,ghosted_at:unlock.unlocked_at,absence_start:period.utc_end,return_started_at:first.played_at,return_window_end:returnEnd,absence_days:Math.floor((Date.parse(first.played_at)-Date.parse(period.utc_end))/86400000),return_scrobbles:qualifying.length,return_scrobble_ids:qualifying.slice(0,10).map(row=>row.id),coverage_ratio:Number(coverage?.coverage_ratio||0),coverage_continuous:Boolean(coverage?.continuous),evidence_version:1});
+  }
+  return evidence;
+}
+async function discoveryListeningInput(username) {
+  const epoch=await getActiveLastfmEpoch(username); if(!epoch)return {periods:[],loveDive:[],goneReturns:[],finalizableWindows:[]};
+  const [periods,loveRows]=await Promise.all([
+    sb(`listening_period_snapshots?user_id=eq.${encodeURIComponent(username)}&epoch_id=eq.${epoch.id}&select=id,epoch_id,period_type,local_start,local_end,utc_start,utc_end,timezone,coverage_ratio,coverage_continuous,completeness,scrobble_total,rankings,snapshot_version&order=local_start.asc&limit=1000`),
+    sb('rpc/discovery_love_dive_evidence',{method:'POST',body:JSON.stringify({p_user_id:username,p_epoch_id:epoch.id,p_limit:50})})
+  ]);
+  const artistIds=[...new Set((loveRows||[]).map(row=>row.artist_id).filter(Boolean))];
+  const artists=artistIds.length?await sb(`music_artists?id=in.(${artistIds.join(',')})&select=id,display_name,musicbrainz_artist_mbid`):[];
+  const artistById=new Map((artists||[]).map(row=>[row.id,row]));
+  const coverageRows=loveRows?.length?await sb('rpc/hybrid_coverage_evidence',{method:'POST',body:JSON.stringify({p_user_id:username,p_epoch_id:epoch.id,p_windows:loveRows.map(row=>({key:row.artist_id,start:row.first_played_at,end:row.window_end}))})}):[];
+  const earliestWindow=(loveRows||[]).map(row=>row.first_played_at).sort()[0], latestWindow=(loveRows||[]).map(row=>row.window_end).sort().at(-1);
+  const knownGaps=earliestWindow?await sb(`listening_coverage_windows?user_id=eq.${encodeURIComponent(username)}&epoch_id=eq.${epoch.id}&status=in.(coverage_gap,disconnected)&coverage_end=gt.${encodeURIComponent(earliestWindow)}&coverage_start=lt.${encodeURIComponent(latestWindow)}&select=coverage_start,coverage_end,status`):[];
+  const coverageById=new Map((coverageRows||[]).map(row=>[row.metric_key,row]));
+  const loveDive=(loveRows||[]).map(row=>{ const coverage=coverageById.get(row.artist_id)||{},artist=artistById.get(row.artist_id)||{},terminalCoverageGap=(knownGaps||[]).some(gap=>Date.parse(gap.coverage_end)>Date.parse(row.first_played_at)&&Date.parse(gap.coverage_start)<Date.parse(row.window_end)); return {epoch_id:epoch.id,artist:{id:row.artist_id,mbid:artist.musicbrainz_artist_mbid||null,name:artist.display_name||''},first_played_at:row.first_played_at,window_start:row.first_played_at,window_end:row.window_end,window_complete:Date.parse(row.window_end)<=Date.now(),artist_scrobbles:Number(row.artist_scrobbles),total_scrobbles:Number(row.total_scrobbles),artist_rank:Number(row.artist_rank),identity_complete:Number(row.resolved_artist_scrobbles)===Number(row.total_scrobbles)&&Number(row.pending_identity)===0,coverage_ratio:Number(coverage.coverage_ratio||0),coverage_continuous:Boolean(coverage.continuous),terminal_coverage_gap:terminalCoverageGap,pending_identity:Number(row.pending_identity),evidence_version:Number(row.evidence_version||1)}; });
+  const finalizableWindows=loveDive.filter(row=>row.pending_identity===0&&(row.coverage_continuous||row.terminal_coverage_gap)).map(row=>row.artist.id);
+  return {periods:periods||[],loveDive,goneReturns:await discoveryGoneReturns(username,epoch),finalizableWindows,epoch};
+}
+async function evaluateDiscoveryListeningAchievements(username,source='discovery_temporal_evaluation') {
+  if(!isAchievementBetaUser(username))return [];
+  await ensureAchievementDefinitions();
+  const input=await discoveryListeningInput(username),evaluation=DiscoveryRules.evaluateListening(input);
+  const unlocks=await persistAchievementCandidates(username,evaluation.candidates,source,new Date().toISOString());
+  for(const artistId of input.finalizableWindows||[]) await sb(`listening_discovery_artist_windows?user_id=eq.${encodeURIComponent(username)}&epoch_id=eq.${input.epoch.id}&artist_id=eq.${artistId}`,{method:'PATCH',headers:{Prefer:'return=minimal'},body:JSON.stringify({evaluated_at:new Date().toISOString(),updated_at:new Date().toISOString()})});
+  return unlocks;
+}
 async function closeAchievementPeriodsForUser(username) {
   const epoch=await getActiveLastfmEpoch(username); if(!epoch)return {status:'not_configured',closed:0};
   let state=(await sb(`listening_period_closer_state?user_id=eq.${encodeURIComponent(username)}&epoch_id=eq.${epoch.id}&limit=1`))?.[0];
@@ -1658,25 +1701,27 @@ async function closeAchievementPeriodsForUser(username) {
   if(state.timezone!==epoch.timezone) { const resetAt=new Date().toISOString(); await sb(`listening_period_closer_state?user_id=eq.${encodeURIComponent(username)}&epoch_id=eq.${epoch.id}`,{method:'PATCH',headers:{Prefer:'return=minimal'},body:JSON.stringify({timezone:epoch.timezone,closing_started_at:resetAt,updated_at:resetAt})}); state={...state,timezone:epoch.timezone,closing_started_at:resetAt}; }
   const closeGraceMs=24*60*60*1000;
   const specs=PeriodIntelligence.closedPeriodSpecs(state.closing_started_at,new Date(),state.timezone,epoch.lastfm_tracking_started_at), existing=await sb(`listening_period_snapshots?user_id=eq.${encodeURIComponent(username)}&epoch_id=eq.${epoch.id}&select=period_type,local_start&limit=1000`), keys=new Set((existing||[]).map(x=>`${x.period_type}|${x.local_start}`)), pending=specs.filter(x=>Date.parse(x.utc_end)<=Date.now()-closeGraceMs&&!keys.has(`${x.period_type}|${x.local_start}`));
-  if(!pending.length)return {status:'current',closed:0};
+  if(!pending.length) { await evaluateDiscoveryListeningAchievements(username,'period_close'); return {status:'current',closed:0}; }
   const earliest=pending.map(x=>x.local_start).sort()[0];
-  const [dailyTotals,dailyReleases,dailyArtists,groups,artists]=await Promise.all([
+  const [dailyTotals,dailyReleases,dailyArtists,groups,artists,artistSegments]=await Promise.all([
     sb(`listening_daily_totals?user_id=eq.${encodeURIComponent(username)}&local_date=gte.${earliest}&select=local_date,scrobble_count&limit=10000`),
     sb(`listening_daily_release_group_counts?user_id=eq.${encodeURIComponent(username)}&local_date=gte.${earliest}&select=local_date,release_group_id,scrobble_count&limit=20000`),
     sb(`listening_daily_artist_counts?user_id=eq.${encodeURIComponent(username)}&local_date=gte.${earliest}&select=local_date,artist_id,scrobble_count&limit=20000`),
     sb('music_release_groups?select=id,display_title,musicbrainz_release_group_mbid,music_artists!inner(display_name)&limit=5000'),
-    sb('music_artists?select=id,display_name,musicbrainz_artist_mbid&limit=5000')
+    sb('music_artists?select=id,display_name,musicbrainz_artist_mbid&limit=5000'),
+    sb('rpc/discovery_period_artist_segments',{method:'POST',body:JSON.stringify({p_user_id:username,p_epoch_id:epoch.id,p_windows:pending.filter(x=>x.period_type==='week').map(x=>({key:`${x.period_type}:${x.local_start}`,start:x.utc_start,end:x.utc_end}))})})
   ]);
   const releaseMeta=Object.fromEntries((groups||[]).map(x=>[x.id,{release_group:{id:x.id,mbid:x.musicbrainz_release_group_mbid,title:x.display_title,artist:x.music_artists?.display_name||''}}])),artistMeta=Object.fromEntries((artists||[]).map(x=>[x.id,{artist:{id:x.id,mbid:x.musicbrainz_artist_mbid,name:x.display_name}}]));
-  const periodCoverageRows=await sb('rpc/hybrid_coverage_evidence',{method:'POST',body:JSON.stringify({p_user_id:username,p_epoch_id:epoch.id,p_windows:pending.map(x=>({key:`${x.period_type}:${x.local_start}`,start:x.utc_start,end:x.utc_end}))})}),periodCoverage=new Map((periodCoverageRows||[]).map(x=>[x.metric_key,Number(x.coverage_ratio||0)])); let closed=0;
+  const periodCoverageRows=await sb('rpc/hybrid_coverage_evidence',{method:'POST',body:JSON.stringify({p_user_id:username,p_epoch_id:epoch.id,p_windows:pending.map(x=>({key:`${x.period_type}:${x.local_start}`,start:x.utc_start,end:x.utc_end}))})}),periodCoverage=new Map((periodCoverageRows||[]).map(x=>[x.metric_key,{ratio:Number(x.coverage_ratio||0),continuous:Boolean(x.continuous)}])); let closed=0;
   for(const spec of pending) {
     const blockers=await sb(`listening_scrobbles?user_id=eq.${encodeURIComponent(username)}&epoch_id=eq.${epoch.id}&played_at=gte.${encodeURIComponent(spec.utc_start)}&played_at=lt.${encodeURIComponent(spec.utc_end)}&enrichment_status=in.(pending,retry)&select=id&limit=1`);
     if(blockers?.length)continue;
-    const coverageRatio=periodCoverage.get(`${spec.period_type}:${spec.local_start}`)||0,snapshot=PeriodIntelligence.buildSnapshot(spec,{dailyTotals,dailyReleases,dailyArtists,releaseMeta,artistMeta,coverageRatio,epochId:epoch.id});
+    const coverage=periodCoverage.get(`${spec.period_type}:${spec.local_start}`)||{ratio:0,continuous:false},snapshot=PeriodIntelligence.buildSnapshot(spec,{dailyTotals,dailyReleases,dailyArtists,artistSegments,releaseMeta,artistMeta,coverageRatio:coverage.ratio,coverageContinuous:coverage.continuous,epochId:epoch.id});
     const rows=await sb('listening_period_snapshots?on_conflict=user_id,epoch_id,period_type,local_start',{method:'POST',headers:{Prefer:'resolution=ignore-duplicates,return=representation'},body:JSON.stringify({user_id:username,...snapshot})}); if(rows?.length)closed+=1;
   }
   await sb(`listening_period_closer_state?user_id=eq.${encodeURIComponent(username)}&epoch_id=eq.${epoch.id}`,{method:'PATCH',headers:{Prefer:'return=minimal'},body:JSON.stringify({last_closed_at:new Date().toISOString(),updated_at:new Date().toISOString()})});
   if(closed)await evaluateHybridAchievements(username,'period_close');
+  await evaluateDiscoveryListeningAchievements(username,'period_close');
   return {status:'success',closed};
 }
 async function closeAchievementPeriodsForAll() { const users=await sb('users?select=username&limit=50'),results=[]; for(const row of users||[])if(isAchievementBetaUser(row.username))results.push({user_id:row.username,...await closeAchievementPeriodsForUser(row.username)}); return results; }
@@ -1783,9 +1828,11 @@ async function processAchievementEvent(username, eventId) {
   await writeProgress(username, evaluation.progress);
   await writeArtistAchievementProgress(username, evaluation.artistProgress);
   const unlocks=await persistAchievementCandidates(username,evaluation.candidates,event.source,event.occurred_at);
+  const discoveryEvaluation=DiscoveryRules.evaluateVault({event,eligibleEvents});
+  const discoveryUnlocks=await persistAchievementCandidates(username,discoveryEvaluation.candidates,event.source,event.occurred_at);
   const hybridUnlocks=await evaluateHybridAchievements(username,event.type==='identity_resolved'?'identity_enrichment':event.source);
   await refreshRatingRecords(username, eligibleEvents);
-  const allUnlocks=[...unlocks,...hybridUnlocks];
+  const allUnlocks=[...unlocks,...discoveryUnlocks,...hybridUnlocks];
   await sb(`vault_achievement_events?event_id=eq.${eventId}`,{method:'PATCH',headers:{Prefer:'return=minimal'},body:JSON.stringify({processed_at:new Date().toISOString(),unlock_ids:allUnlocks.map(u=>u.id)})});
   return allUnlocks;
 }
@@ -1801,9 +1848,9 @@ async function achievementReadModel(username) {
     sb(`vault_achievement_showcase?user_id=eq.${encodeURIComponent(username)}&order=position.asc`), sb(`vault_personal_records?user_id=eq.${encodeURIComponent(username)}`),
     sb(`vault_achievement_inbox?user_id=eq.${encodeURIComponent(username)}&delivered_at=is.null&order=created_at.asc`), sb(`vault_achievement_state?user_id=eq.${encodeURIComponent(username)}&select=achievement_tracking_started_at&limit=1`)
   ]);
-  const unlockedKeys=new Set(unlocks.map(u=>u.achievement_key));
-  const safeDefinitions=maskAchievementDefinitions(defs,unlocks);
-  return { definitions:safeDefinitions, progress, artistProgress, unlocks, showcase, records, inbox, trackingStartedAt:state?.[0]?.achievement_tracking_started_at || null, availableCount:safeDefinitions.length, unlockedFamilies:unlockedKeys.size };
+  const safe=achievementTrustBoundary({definitions:defs,progress,artistProgress,unlocks,showcase,inbox});
+  const unlockedKeys=new Set(safe.unlocks.map(u=>u.achievement_key));
+  return { ...safe, records, trackingStartedAt:state?.[0]?.achievement_tracking_started_at || null, unlockedFamilies:unlockedKeys.size };
 }
 
 // ── Migración única de portadas de Vault ──

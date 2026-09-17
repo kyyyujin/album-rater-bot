@@ -14,13 +14,17 @@ const secondWeek=specs.filter(x=>x.period_type==='week')[1]; assert(secondWeek&&
 const firstMonth=specs.find(x=>x.period_type==='month'); assert(firstMonth.initial_partial,'the activation month is not eligible');
 
 const snapshot=Period.buildSnapshot(secondWeek,{
-  epochId:'e1',coverageRatio:.95,
+  epochId:'e1',coverageRatio:.95,coverageContinuous:true,
   dailyTotals:[{local_date:secondWeek.local_start,scrobble_count:30}],
   dailyReleases:[{local_date:secondWeek.local_start,release_group_id:'g2',scrobble_count:10},{local_date:secondWeek.local_start,release_group_id:'g1',scrobble_count:20}],
   dailyArtists:[{local_date:secondWeek.local_start,artist_id:'a1',scrobble_count:22}],
+  artistSegments:[{metric_key:`week:${secondWeek.local_start}`,segment:'day',artist_id:'a1',scrobble_count:20},{metric_key:`week:${secondWeek.local_start}`,segment:'night',artist_id:'a2',scrobble_count:20},{metric_key:`week:${secondWeek.local_start}`,segment:'night',artist_id:null,scrobble_count:2}],
   releaseMeta:{g1:{release_group:{id:'g1',title:'One'}}},artistMeta:{a1:{artist:{id:'a1',name:'Artist'}}}
 });
 assert.strictEqual(snapshot.completeness,'complete'); assert.strictEqual(snapshot.scrobble_total,30); assert.deepStrictEqual(snapshot.rankings.release_groups.map(x=>x.id),['g1','g2']);
+assert.strictEqual(snapshot.coverage_continuous,true);
+assert.strictEqual(snapshot.rankings.artist_segments.day[0].id,'a1'); assert.strictEqual(snapshot.rankings.artist_segments.night[0].id,'a2');
+assert.strictEqual(snapshot.rankings.artist_segment_unresolved.night,2);
 assert.strictEqual(Period.buildSnapshot({...secondWeek,initial_partial:true},{epochId:'e1',coverageRatio:1}).completeness,'partial');
 assert.strictEqual(Period.buildSnapshot(secondWeek,{epochId:'e1',coverageRatio:.899}).completeness,'incomplete');
 
