@@ -1,15 +1,39 @@
-[eval]:1
-process.stdout.write(require('fs').readFileSync(discord-posting.test.js,'utf8'))
-                                                ^
+'use strict';
 
-ReferenceError: discord is not defined
-    at [eval]:1:49
-    at runScriptInThisContext (node:internal/vm:219:10)
-    at node:internal/process/execution:451:12
-    at [eval]-wrapper:6:24
-    at runScriptInContext (node:internal/process/execution:449:60)
-    at evalFunction (node:internal/process/execution:283:30)
-    at evalTypeScript (node:internal/process/execution:295:3)
-    at node:internal/main/eval_string:71:3
+const assert = require('assert');
+const {
+  normalizeDiscordThreadId,
+  discordPostFailure
+} = require('./discord-posting');
 
-Node.js v24.19.0
+function response(status, headers = {}) {
+  return {
+    status,
+    headers: { get: name => headers[String(name).toLowerCase()] || null }
+  };
+}
+
+assert.strictEqual(normalizeDiscordThreadId('1315912659295666286'), '1315912659295666286');
+assert.strictEqual(normalizeDiscordThreadId(' 1315912659295666286 '), '1315912659295666286');
+assert.strictEqual(normalizeDiscordThreadId('abc'), null);
+assert.strictEqual(normalizeDiscordThreadId('1234'), null);
+
+const rateLimited = discordPostFailure(response(429, {
+  'retry-after': '12.5',
+  'x-ratelimit-scope': 'global',
+  'x-ratelimit-global': 'true',
+  'x-ratelimit-bucket': 'message-bucket'
+}), { retry_after: 9, global: true });
+assert.strictEqual(rateLimited.status, 429);
+assert.strictEqual(rateLimited.code, 'discord_rate_limited');
+assert.strictEqual(rateLimited.retry_after_seconds, 9);
+assert.strictEqual(rateLimited.scope, 'global');
+assert.strictEqual(rateLimited.global, true);
+assert.strictEqual(rateLimited.bucket, 'message-bucket');
+
+const unavailable = discordPostFailure(response(403), {});
+assert.strictEqual(unavailable.status, 502);
+assert.strictEqual(unavailable.code, 'discord_destination_unavailable');
+assert(!/Discord API error/i.test(unavailable.error));
+
+console.log('discord posting tests passed');
