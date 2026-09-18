@@ -1,15 +1,37 @@
-[eval]:1
-process.stdout.write(require('fs').readFileSync(register-discord-commands.js,'utf8'))
-                                                ^
+'use strict';
 
-ReferenceError: register is not defined
-    at [eval]:1:49
-    at runScriptInThisContext (node:internal/vm:219:10)
-    at node:internal/process/execution:451:12
-    at [eval]-wrapper:6:24
-    at runScriptInContext (node:internal/process/execution:449:60)
-    at evalFunction (node:internal/process/execution:283:30)
-    at evalTypeScript (node:internal/process/execution:295:3)
-    at node:internal/main/eval_string:71:3
+const { REST, Routes, SlashCommandBuilder } = require('discord.js');
 
-Node.js v24.19.0
+const token = process.env.BOT_TOKEN;
+const clientId = process.env.CLIENT_ID;
+
+if (!token || !clientId) {
+  throw new Error('BOT_TOKEN y CLIENT_ID deben estar configurados para registrar comandos.');
+}
+
+const commands = [
+  new SlashCommandBuilder().setName('ping').setDescription('Comprueba si el bot está activo'),
+  new SlashCommandBuilder()
+    .setName('historial')
+    .setDescription('Muestra tus últimos ratings')
+    .addStringOption(opt => opt.setName('usuario').setDescription('Nombre de usuario (default: el tuyo)').setRequired(false))
+    .addIntegerOption(opt => opt.setName('cantidad').setDescription('Cuántos mostrar (máx 10, default 5)').setMinValue(1).setMaxValue(10).setRequired(false)),
+  new SlashCommandBuilder()
+    .setName('top')
+    .setDescription('Álbumes mejor rankeados')
+    .addStringOption(opt => opt.setName('usuario').setDescription('Nombre de usuario (default: el tuyo)').setRequired(false))
+    .addIntegerOption(opt => opt.setName('cantidad').setDescription('Cuántos mostrar (máx 10, default 5)').setMinValue(1).setMaxValue(10).setRequired(false)),
+  new SlashCommandBuilder()
+    .setName('stats')
+    .setDescription('Estadísticas generales de ratings')
+    .addStringOption(opt => opt.setName('usuario').setDescription('Nombre de usuario (default: el tuyo)').setRequired(false))
+].map(command => command.toJSON());
+
+new REST({ version: '10' })
+  .setToken(token)
+  .put(Routes.applicationCommands(clientId), { body: commands })
+  .then(() => console.log('Slash commands registered'))
+  .catch(error => {
+    console.error('Failed to register slash commands:', error.message);
+    process.exitCode = 1;
+  });
