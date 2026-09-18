@@ -1,12 +1,15 @@
-[eval]:1
-process.stdout.write(require('fs').readFileSync(migrations/20260918003000_rater_discord_post_security.sql,'utf8'))
-                                                                          ^
-Expression expected
+-- Discord posting configuration belongs to the authenticated Rater user, not to
+-- untrusted browser form data. This table is consumed only by the backend's
+-- service-role path; no browser-facing grants are added here.
+begin;
 
-SyntaxError: Numeric separators are not allowed at the end of numeric literals
-    at makeContextifyScript (node:internal/vm:194:14)
-    at compileScript (node:internal/process/execution:388:10)
-    at evalTypeScript (node:internal/process/execution:260:22)
-    at node:internal/main/eval_string:71:3
+create table if not exists public.rater_discord_settings (
+  user_id text primary key references public.users(username) on delete cascade,
+  thread_id text not null check (thread_id ~ '^[0-9]{17,20}$'),
+  updated_at timestamptz not null default clock_timestamp()
+);
 
-Node.js v24.19.0
+alter table public.rater_discord_settings enable row level security;
+revoke all on table public.rater_discord_settings from anon, authenticated;
+
+commit;
