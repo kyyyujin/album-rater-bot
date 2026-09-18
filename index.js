@@ -4,7 +4,7 @@ const fetch     = require('node-fetch');
 const FormData  = require('form-data');
 const sharp     = require('sharp');
 const puppeteer = require('puppeteer');
-const { Client, GatewayIntentBits, REST, Routes, SlashCommandBuilder, EmbedBuilder } = require('discord.js');
+const { Client, GatewayIntentBits, EmbedBuilder } = require('discord.js');
 const AchievementRules = require('./achievement-rules');
 const ListeningRules = require('./listening-rules');
 const ListeningIntelligence = require('./listening-intelligence');
@@ -15,6 +15,7 @@ const { achievementTrustBoundary } = require('./secret-visibility');
 const { normalizeIanaTimezone, localListeningParts } = require('./timezone-utils');
 const { classifyEnrichmentError, parseRetryAfter, retryDelayMs } = require('./enrichment-reliability');
 const { createSchedulerPipelines } = require('./scheduler-pipelines');
+const { normalizeDiscordThreadId, discordPostFailure } = require('./discord-posting');
 
 const app    = express();
 // Render's small instances are memory constrained. libvips must not retain a
@@ -29,7 +30,6 @@ const upload = multer({
 });
 
 const BOT_TOKEN    = process.env.BOT_TOKEN;
-const CLIENT_ID    = process.env.CLIENT_ID;
 const SUPABASE_URL = process.env.SUPABASE_URL;
 const SUPABASE_KEY = process.env.SUPABASE_KEY;
 const LASTFM_API_KEY = process.env.LASTFM_API_KEY;
@@ -40,61 +40,13 @@ const LASTFM_PAGE_SIZE = 200;
 
 // ── Discord OAuth (login web, distinto del bot de gateway) ──
 // CLIENT_ID se reutiliza (es la misma app de Discord que ya tenés).
+const CLIENT_ID = process.env.CLIENT_ID;
 const DISCORD_CLIENT_SECRET = process.env.DISCORD_CLIENT_SECRET; // Nuevo: sacalo de Discord Developer Portal → OAuth2
 const DISCORD_REDIRECT_URI  = process.env.DISCORD_REDIRECT_URI;  // Nuevo: ej. https://album-rater-bot.onrender.com/auth/discord/callback
                                                                    // Debe estar registrada tal cual en Discord Developer Portal → OAuth2 → Redirects
 // El Rater está temporalmente reservado para la cuenta propietaria. Vault sigue usando el login compartido sin esta restricción.
 const oauthStates = {}; // state (random) -> { returnTo, expires }  — anti-CSRF + para saber a qué página volver (Rater o Vault)
 const pendingDiscordProfiles = {}; // pendingToken -> { discordId, discordUsername, discordAvatar, expires } — cuenta de Discord sin match automático, esperando que el usuario confirme si tiene cuenta vieja
-
-// ── Register slash commands ──
-const commands = [
-  new SlashCommandBuilder()
-    .setName('ping')
-    .setDescription('Comprueba si el bot está activo'),
-
-  new SlashCommandBuilder()
-    .setName('historial')
-    .setDescription('Muestra tus últimos ratings')
-    .addStringOption(opt =>
-      opt.setName('usuario')
-        .setDescription('Nombre de usuario (default: el tuyo)')
-        .setRequired(false))
-    .addIntegerOption(opt =>
-      opt.setName('cantidad')
-        .setDescription('Cuántos mostrar (máx 10, default 5)')
-        .setMinValue(1).setMaxValue(10).setRequired(false)),
-
-  new SlashCommandBuilder()
-    .setName('top')
-    .setDescription('Álbumes mejor rankeados')
-    .addStringOption(opt =>
-      opt.setName('usuario')
-        .setDescription('Nombre de usuario (default: el tuyo)')
-        .setRequired(false))
-    .addIntegerOption(opt =>
-      opt.setName('cantidad')
-        .setDescription('Cuántos mostrar (máx 10, default 5)')
-        .setMinValue(1).setMaxValue(10).setRequired(false)),
-
-  new SlashCommandBuilder()
-    .setName('stats')
-    .setDescription('Estadísticas generales de ratings')
-    .addStringOption(opt =>
-      opt.setName('usuario')
-        .setDescription('Nombre de usuario (default: el tuyo)')
-        .setRequired(false)),
-].map(c => c.toJSON());
-
-async function registerCommands() {
-  try {
-    const rest = new REST({ version: '10' }).setToken(BOT_TOKEN);
-    await rest.put(Routes.applicationCommands(CLIENT_ID), { body: commands });
-    console.log('Slash commands registered');
-  } catch(e) {
-    console.error('Failed to register commands:', e.message);
-  }
-}
 
 // ── Supabase helpers ──
 async function getRatings(user_id, limit = null) {
@@ -166,7 +118,8 @@ const client = new Client({ intents: [GatewayIntentBits.Guilds] });
 client.once('ready', async () => {
   console.log(`Bot online: ${client.user.tag}`);
   client.user.setActivity('rateando álbumes 🎵', { type: 3 }); // WATCHING
-  await registerCommands();
+  // Los comandos se registran explícitamente con `npm run register:discord-commands`.
+  // Reescribirlos en cada reinicio del web service genera llamadas innecesarias a Discord.
 });
 
 client.on('interactionCreate', async interaction => {
@@ -530,12 +483,31 @@ async function changeBotPfp(coverUrl) {
   } catch(e) { console.error('PFP error:', e.message); }
 }
 
+async function getRaterDiscordThreadId(username) {
+  const rows = await sb(`rater_discord_settings?user_id=eq.${encodeURIComponent(username)}&select=thread_id&limit=1`);
+  return normalizeDiscordThreadId(rows?.[0]?.thread_id);
+}
+
+async function saveRaterDiscordThreadId(username, threadId) {
+  const normalized = normalizeDiscordThreadId(threadId);
+  if (!normalized) throw new Error('Thread ID inválido');
+  await sb('rater_discord_settings?on_conflict=user_id', {
+    method: 'POST',
+    headers: { Prefer: 'resolution=merge-duplicates,return=minimal' },
+    body: JSON.stringify({ user_id: username, thread_id: normalized, updated_at: new Date().toISOString() })
+  });
+  return normalized;
+}
+
 app.post('/post', upload.single('file'), async (req, res) => {
   try {
-    const { title, thread_id, user_id, artist, cover_url, cover_score, tracks, final_score, final_rank, notes } = req.body;
+    const { title, artist, cover_url, cover_score, tracks, final_score, final_rank, notes, auth_token } = req.body;
+    const username = await verifyTokenFromStore(auth_token);
+    if (!username) return res.status(401).json({ error: 'Sesión inválida o expirada' });
     if (!req.file)  return res.status(400).json({ error: 'No image provided' });
     if (!title)     return res.status(400).json({ error: 'No title provided' });
-    if (!thread_id) return res.status(400).json({ error: 'No thread_id provided' });
+    const thread_id = await getRaterDiscordThreadId(username);
+    if (!thread_id) return res.status(409).json({ error: 'Configurá y guardá tu Thread ID de Discord antes de enviar.' });
 
     const form = new FormData();
     form.append('payload_json', JSON.stringify({ attachments: [{ id: '0', filename: 'rating.png' }] }), { contentType: 'application/json' });
@@ -546,34 +518,49 @@ app.post('/post', upload.single('file'), async (req, res) => {
       headers: { 'Authorization': `Bot ${BOT_TOKEN}`, ...form.getHeaders() },
       body: form
     });
-    const discordData = await discordRes.json();
-    if (!discordRes.ok) return res.status(500).json({ error: 'Discord API error', details: discordData });
-
-    if (user_id) {
-      try {
-        const cleanTitle = req.body.album_title || title;
-        await saveRating({
-          user_id,
-          album_title: cleanTitle,
-          artist:      artist      || null,
-          cover_url:   cover_url   || null,
-          cover_score: cover_score !== undefined && cover_score !== '' ? parseFloat(cover_score) : null,
-          year:        req.body.year  || null,
-          genre:       req.body.genre || null,
-          tracks:      tracks ? JSON.parse(tracks) : null,
-          final_score: final_score ? parseFloat(final_score) : null,
-          final_rank:  final_rank  || null,
-          notes:       notes       || null
-        });
-      } catch(e) { console.error('Supabase error:', e.message); }
+    let discordData = {};
+    try { discordData = await discordRes.json(); } catch (_) {}
+    if (!discordRes.ok) {
+      const failure = discordPostFailure(discordRes, discordData);
+      console.warn('[discord-post]', JSON.stringify({
+        event: 'discord_post_failed',
+        user: username,
+        discord_status: discordRes.status,
+        code: failure.code,
+        retry_after_seconds: failure.retry_after_seconds,
+        scope: failure.scope,
+        global: failure.global,
+        bucket: failure.bucket
+      }));
+      if (failure.retry_after_seconds !== null && failure.retry_after_seconds !== undefined) {
+        res.set('Retry-After', String(failure.retry_after_seconds));
+      }
+      return res.status(failure.status).json(failure);
     }
+
+    try {
+      const cleanTitle = req.body.album_title || title;
+      await saveRating({
+        user_id: username,
+        album_title: cleanTitle,
+        artist:      artist      || null,
+        cover_url:   cover_url   || null,
+        cover_score: cover_score !== undefined && cover_score !== '' ? parseFloat(cover_score) : null,
+        year:        req.body.year  || null,
+        genre:       req.body.genre || null,
+        tracks:      tracks ? JSON.parse(tracks) : null,
+        final_score: final_score ? parseFloat(final_score) : null,
+        final_rank:  final_rank  || null,
+        notes:       notes       || null
+      });
+    } catch(e) { console.error('Supabase error:', e.message); }
 
     if (cover_url) changeBotPfp(cover_url).catch(console.error);
 
     res.json({ ok: true, message: discordData.id });
   } catch(err) {
-    console.error(err);
-    res.status(500).json({ error: err.message });
+    console.error('[discord-post]', err.message);
+    res.status(500).json({ error: 'No se pudo completar el envío a Discord.' });
   }
 });
 
@@ -2042,6 +2029,34 @@ app.post('/rater-access', express.json(), async (req, res) => {
   } catch (err) {
     console.error('[rater-access]', err.message);
     res.status(500).json({ error: 'No se pudo verificar el acceso al Rater' });
+  }
+});
+
+// The posting destination is private server-side configuration. The browser may
+// edit it only through an authenticated session; /post itself never accepts a
+// destination or user identity from form data.
+app.post('/rater/discord-settings', express.json(), async (req, res) => {
+  try {
+    const username = await verifyTokenFromStore(req.body?.token);
+    if (!username) return res.status(401).json({ error: 'Sesión inválida o expirada' });
+    const threadId = await saveRaterDiscordThreadId(username, req.body?.thread_id);
+    res.json({ ok: true, thread_id: threadId });
+  } catch (err) {
+    const isInvalidThread = /Thread ID inválido/i.test(String(err?.message || ''));
+    if (isInvalidThread) return res.status(400).json({ error: 'Ingresá un Thread ID válido de Discord.' });
+    console.error('[rater discord settings]', err.message);
+    res.status(500).json({ error: 'No se pudo guardar la configuración de Discord.' });
+  }
+});
+
+app.post('/rater/discord-settings/get', express.json(), async (req, res) => {
+  try {
+    const username = await verifyTokenFromStore(req.body?.token);
+    if (!username) return res.status(401).json({ error: 'Sesión inválida o expirada' });
+    res.json({ ok: true, thread_id: await getRaterDiscordThreadId(username) });
+  } catch (err) {
+    console.error('[rater discord settings get]', err.message);
+    res.status(500).json({ error: 'No se pudo cargar la configuración de Discord.' });
   }
 });
 
