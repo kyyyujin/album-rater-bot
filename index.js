@@ -501,7 +501,7 @@ async function saveRaterDiscordThreadId(username, threadId) {
 
 app.post('/post', upload.single('file'), async (req, res) => {
   try {
-    const { title, artist, cover_url, cover_score, tracks, final_score, final_rank, notes, auth_token } = req.body;
+    const { title, artist, cover_url, cover_score, tracks, final_score, final_rank, notes, auth_token } = req.body || {};
     const username = await verifyTokenFromStore(auth_token);
     if (!username) return res.status(401).json({ error: 'Sesión inválida o expirada' });
     if (!req.file)  return res.status(400).json({ error: 'No image provided' });
