@@ -9,10 +9,7 @@ const DEFINITIONS = [
   {key:'aged_like_milk',title:'Aged Like Milk',category:'Discovery',rarity:'Epic',maxLevel:1,ruleVersion:1,metadata:{discovery:true,emblemEligible:false}},
   {key:'perfectly_imperfect',title:'Perfectly Imperfect',category:'Discovery',rarity:'Epic',maxLevel:1,ruleVersion:1,metadata:{discovery:true,emblemEligible:false}},
   {key:'double_life',title:'Double Life',category:'Discovery',rarity:'Legendary',maxLevel:1,ruleVersion:1,metadata:{discovery:true,emblemEligible:false}},
-  // The recovered final spec describes an album rescore while the Phase 4A
-  // work prompt requires Recording identity. Until one authoritative semantic
-  // exists this definition is registered, disabled and impossible to unlock.
-  {key:'same_song_different_me',title:'Same Song, Different Me',category:'Discovery',rarity:'Legendary',maxLevel:1,ruleVersion:1,enabled:false,metadata:{discovery:true,emblemEligible:false,blockedBySpecAmbiguity:true}},
+  {key:'same_song_different_me',title:'Same Song, Different Me',category:'Discovery',rarity:'Legendary',maxLevel:1,ruleVersion:1,metadata:{discovery:true,emblemEligible:false}},
   {key:'love_dive',title:'LOVE DIVE',category:'Discovery',rarity:'Legendary',maxLevel:1,ruleVersion:1,metadata:{discovery:true,emblemEligible:false}},
   {key:'gone_but_not_forgotten',title:'Gone But Not Forgotten',category:'Discovery',rarity:'Legendary',maxLevel:1,ruleVersion:1,metadata:{discovery:true,emblemEligible:false}}
 ];
@@ -46,6 +43,27 @@ function evaluateVault({event,eligibleEvents=[]}={}) {
       candidates.push(candidate('aged_like_milk',{album:albumSnapshot(event),previous_event_id:previous.event_id,rescore_event_id:event.event_id,before,after,delta:roundedHundredths(after-before),previous_score_at:previous.at,rescore_at:event.occurred_at,elapsed_days:Math.floor(elapsed/DAY)}));
     }
     const initial=timeline.find(row=>row.type==='album_rated'),rescores=timeline.filter(row=>row.type==='album_rescored');
+    const initialIndex=initial?timeline.findIndex(row=>row.event_id===initial.event_id):-1;
+    const initialScore=roundedHundredths(initial?.score),qualifyingScore=roundedHundredths(after);
+    const elapsedFromInitial=initial?Date.parse(event.occurred_at)-Date.parse(initial.at):NaN;
+    const totalDifference=initialScore===null||qualifyingScore===null?null:Math.abs(Math.round(initialScore*100)-Math.round(qualifyingScore*100))/100;
+    if(initial&&currentIndex>initialIndex&&totalDifference!==null&&totalDifference>=2&&Number.isFinite(elapsedFromInitial)&&elapsedFromInitial>=365*DAY) {
+      candidates.push(candidate('same_song_different_me',{
+        vault_album_id:id,
+        album:albumSnapshot(event),
+        initial_score:initialScore,
+        initial_score_at:initial.at,
+        qualifying_rescore:qualifyingScore,
+        qualifying_rescore_at:event.occurred_at,
+        total_difference:totalDifference,
+        elapsed_days:Math.floor(elapsedFromInitial/DAY),
+        initial_event_id:initial.event_id,
+        qualifying_rescore_event_id:event.event_id,
+        triggering_event_ids:[initial.event_id,event.event_id],
+        rarity:'Legendary',
+        rule_version:1
+      }));
+    }
     if(initial&&rescores.length>=3&&timeline.at(-1)?.event_id===event.event_id) {
       const values=timeline.map(row=>row.score),range=Math.max(...values)-Math.min(...values);
       if(range>=1&&Math.abs(after-initial.score)<.005) candidates.push(candidate('perfectly_imperfect',{album:albumSnapshot(event),initial_score:initial.score,final_score:after,score_change_count:rescores.length,historical_range:roundedHundredths(range),initial_event_id:initial.event_id,final_event_id:event.event_id,timeline}));

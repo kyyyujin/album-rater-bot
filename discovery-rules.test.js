@@ -44,7 +44,5 @@ assert(has(Discovery.evaluateListening({goneReturns:[gone]}),'gone_but_not_forgo
 assert(!has(Discovery.evaluateListening({goneReturns:[{...gone,return_scrobbles:9}]}),'gone_but_not_forgotten'));
 assert(!has(Discovery.evaluateListening({goneReturns:[{...gone,coverage_continuous:false}]}),'gone_but_not_forgotten'));
 assert(!has(Discovery.evaluateListening({goneReturns:[{...gone,absence_days:179}]}),'gone_but_not_forgotten'));
-assert(!Discovery.DEFINITIONS.find(row=>row.key==='same_song_different_me').enabled,'ambiguous spec stays disabled');
-assert(!has(Discovery.evaluateVault({event:p3,eligibleEvents:[p0,p1,p2,p3]}),'same_song_different_me'));
 
 console.log('Discovery rule tests passed');
