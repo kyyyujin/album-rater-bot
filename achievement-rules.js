@@ -21,15 +21,22 @@ const DEFINITION_META = {
   antifragile:{levelRarities:['Rare','Epic','Legendary']},
   artist_archivist:{levelRarities:['Rare','Epic','Legendary'],dynamicTitle:true}
 };
+const VAULT_CATEGORIES={
+  the_beginning:'collection',archivist:'collection',genre_explorer:'collection',curator:'collection',tier_collector:'collection',
+  masterpiece:'rating',savage:'rating',no_skip:'rating',perfectly_balanced:'rating',roller_coaster:'rating',one_good_song:'rating',
+  second_thoughts:'rescore',it_grew_on_me:'rescore',what_was_i_thinking:'rescore',antifragile:'rescore',aged_like_wine:'rescore',
+  talk_that_talk:'review',generational_run:'artist',icon:'artist',artist_archivist:'artist'
+};
 const DEFINITIONS = DEFINITION_ROWS.map(([key,title,rarity,maxLevel]) => ({
   key,title,category:'Vault',rarity,maxLevel,
   ruleVersion:['generational_run','icon','artist_archivist'].includes(key)?2:1,
-  metadata:DEFINITION_META[key] || {}
+  metadata:{...(DEFINITION_META[key] || {}),vaultCategory:VAULT_CATEGORIES[key]}
 }));
 // Listening definitions are evaluated only by the server-side ledger worker.
 // Keeping the public display metadata here lets the existing Achievement Vault
 // render the active catalogue without shipping any secret rule logic.
 for (const listening of require('./listening-rules').DEFINITIONS) DEFINITIONS.push(listening);
+for (const listening of require('./temporal-listening-rules').DEFINITIONS) DEFINITIONS.push(listening);
 for (const hybrid of require('./hybrid-rules').DEFINITIONS) DEFINITIONS.push(hybrid);
 
 function score(v){ const n=Number(v); return Number.isFinite(n) ? Math.round((n+Number.EPSILON)*100)/100 : null; }

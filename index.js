@@ -7,6 +7,8 @@ const puppeteer = require('puppeteer');
 const { Client, GatewayIntentBits, EmbedBuilder } = require('discord.js');
 const AchievementRules = require('./achievement-rules');
 const ListeningRules = require('./listening-rules');
+const TemporalListeningRules = require('./temporal-listening-rules');
+const EmblemRules = require('./emblem-rules');
 const ListeningIntelligence = require('./listening-intelligence');
 const HybridRules = require('./hybrid-rules');
 const DiscoveryRules = require('./discovery-rules');
@@ -941,6 +943,54 @@ async function persistAchievementCandidates(username, candidates, source, occurr
   }
   return unlocks;
 }
+const COSMETIC_REWARDS=[
+  {key:'certified',title:'Certified',achievementKey:'certified_favorite',minimumLevel:1},
+  {key:'the_archivist',title:'The Archivist',achievementKey:'archivist',minimumLevel:5},
+  {key:'questionable_taste',title:'Questionable Taste',achievementKey:'love_foolish',minimumLevel:1},
+  {key:'still_listening',title:'Still Listening',achievementKey:'love_foolish',minimumLevel:2},
+  {key:'no_skips_allowed',title:'No Skips Allowed',achievementKey:'perfect_world',minimumLevel:1}
+];
+async function syncCosmeticEntitlements(username,unlocks=null) {
+  const rows=unlocks||await sb(`vault_achievement_unlocks?user_id=eq.${encodeURIComponent(username)}&select=id,achievement_key,level,unlocked_at`), grants=[];
+  for(const reward of COSMETIC_REWARDS){const source=rows.filter(row=>row.achievement_key===reward.achievementKey&&Number(row.level)>=reward.minimumLevel).sort((a,b)=>Number(a.level)-Number(b.level))[0];if(source)grants.push({user_id:username,cosmetic_key:reward.key,source_achievement_key:reward.achievementKey,source_unlock_id:source.id,granted_at:source.unlocked_at,metadata:{title:reward.title,minimum_level:reward.minimumLevel}});}
+  if(grants.length)await sb('vault_cosmetic_entitlements?on_conflict=user_id,cosmetic_key',{method:'POST',headers:{Prefer:'resolution=ignore-duplicates,return=minimal'},body:JSON.stringify(grants)});
+}
+async function emblemEvaluationInput(username) {
+  const [definitions,unlocks,state,events]=await Promise.all([
+    sb('vault_achievement_definitions?enabled=eq.true&select=key,category,rarity,enabled,is_secret,is_discovery,emblem_eligible,client_metadata'),
+    sb(`vault_achievement_unlocks?user_id=eq.${encodeURIComponent(username)}&select=id,achievement_key,level,snapshot`),getAchievementState(username),getAchievementEvents(username)
+  ]);
+  const eligible=state?.achievement_tracking_started_at?AchievementRules.eligibleAfter(events,state.achievement_tracking_started_at):[];
+  const ratedAlbumIds=eligible.filter(event=>event.type==='album_rated'&&event.payload?.album?.status==='listened').map(eventAlbumId).filter(Boolean);
+  return {definitions,unlocks,ratedAlbumIds};
+}
+async function refreshEmblemState(username) {
+  const evaluation=EmblemRules.evaluate(await emblemEvaluationInput(username));
+  const upgrades=await sb(`vault_emblem_upgrades?user_id=eq.${encodeURIComponent(username)}&select=tier_level,tier_key,evidence,eligible_at,acknowledged_at&order=tier_level.asc`),currentLevel=Math.max(0,...(upgrades||[]).map(row=>Number(row.tier_level)));
+  const next=EmblemRules.TIERS.find(tier=>tier.level===currentLevel+1),pending=next&&evaluation.qualified.some(tier=>tier.level===next.level)?next:null,now=new Date().toISOString();
+  const pendingSnapshot=pending?{tier:{id:pending.id,level:pending.level,title:pending.title},metrics:evaluation.metrics,evidence_version:1,rule_version:1,eligible_at:now}:null;
+  await sb('vault_emblem_state?on_conflict=user_id',{method:'POST',headers:{Prefer:'resolution=merge-duplicates,return=minimal'},body:JSON.stringify({user_id:username,current_level:currentLevel,pending_level:pending?.level||null,pending_snapshot:pendingSnapshot,progress:{metrics:evaluation.metrics,highest_qualified:evaluation.highestQualified?.level||0},evaluated_at:now,updated_at:now})});
+  return {currentLevel,pending:pendingSnapshot,progress:{metrics:evaluation.metrics,highestQualified:evaluation.highestQualified?.level||0},upgrades:upgrades||[],tiers:EmblemRules.TIERS.map(({id,level,title,requirements})=>({id,level,title,requirements}))};
+}
+async function acknowledgePendingEmblem(username) {
+  const state=(await sb(`vault_emblem_state?user_id=eq.${encodeURIComponent(username)}&select=current_level,pending_level,pending_snapshot&limit=1`))?.[0];
+  if(!state?.pending_level||Number(state.pending_level)!==Number(state.current_level)+1)return refreshEmblemState(username);
+  const snapshot=state.pending_snapshot,tier=EmblemRules.TIERS.find(row=>row.level===Number(state.pending_level)); if(!tier)return refreshEmblemState(username);
+  await sb('vault_emblem_upgrades?on_conflict=user_id,tier_level',{method:'POST',headers:{Prefer:'resolution=ignore-duplicates,return=minimal'},body:JSON.stringify({user_id:username,tier_level:tier.level,tier_key:tier.id,evidence:snapshot,eligible_at:snapshot?.eligible_at||new Date().toISOString(),rule_version:1})});
+  return refreshEmblemState(username);
+}
+async function refreshAchievementPrevalence(username) {
+  // The current rollout has one eligible beta account. Cache the real cohort,
+  // but never display percentages until the approved k=30 privacy threshold.
+  const [definitions,unlocks,state]=await Promise.all([
+    sb('vault_achievement_definitions?enabled=eq.true&is_discovery=eq.false&select=key'),
+    sb(`vault_achievement_unlocks?user_id=eq.${encodeURIComponent(username)}&select=achievement_key`),
+    sb(`vault_achievement_state?user_id=eq.${encodeURIComponent(username)}&select=user_id&limit=1`)
+  ]);
+  const unlocked=new Set((unlocks||[]).map(row=>row.achievement_key)),population=state?.length?1:0,now=new Date().toISOString();
+  const rows=(definitions||[]).map(row=>({achievement_key:row.key,eligible_population:population,unlocked_population:unlocked.has(row.key)?1:0,percentage:population?(unlocked.has(row.key)?100:0):null,display_enabled:false,calculated_at:now}));
+  if(rows.length)await sb('vault_achievement_prevalence?on_conflict=achievement_key',{method:'POST',headers:{Prefer:'resolution=merge-duplicates,return=minimal'},body:JSON.stringify(rows)});
+}
 async function refreshRatingRecords(username, eligibleEvents) {
   const records=[];
   for (const event of eligibleEvents || []) {
@@ -1467,6 +1517,21 @@ async function listeningEvaluationInput(username) {
   const runRows=(albumRuns||[]).map(row=>({...row,...(row.evidence||{}),total_duration_ms:Number(row.album_duration_ms),track_timestamps:row.evidence?.track_timestamps||row.evidence?.tracks||[]}));
   return {artists:artistRows,releaseGroups:releaseRows,lucidDream:lucid,magnetic,hyperfixation,trackCounts:trackRows,trackById,tracks:burstTracks,albumRuns:runRows,timezone:epoch?.timezone||'UTC'};
 }
+async function temporalListeningEvaluationInput(username) {
+  const epoch=await getActiveLastfmEpoch(username); if(!epoch)return {periods:[]};
+  const now=new Date().toISOString();
+  const [raw,periods]=await Promise.all([
+    sb('rpc/achievement_temporal_listening_evidence',{method:'POST',body:JSON.stringify({p_user_id:username,p_epoch_id:epoch.id,p_now:now})}),
+    sb(`listening_period_snapshots?user_id=eq.${encodeURIComponent(username)}&epoch_id=eq.${epoch.id}&select=id,period_type,local_start,local_end,utc_start,utc_end,timezone,coverage_ratio,coverage_continuous,completeness,scrobble_total,rankings,snapshot_version&order=local_start.asc&limit=1000`)
+  ]);
+  const evidence=Array.isArray(raw)?raw[0]:raw,window30=evidence?.window30||{},window60=evidence?.window60||{};
+  const groupIds=[...new Set((evidence?.lost_found||[]).map(row=>row.release_group_id).filter(Boolean))];
+  const groups=groupIds.length?await sb(`music_release_groups?id=in.(${groupIds.join(',')})&select=id,display_title,musicbrainz_release_group_mbid,music_artists!inner(display_name)`):[];
+  const groupById=new Map((groups||[]).map(row=>[row.id,row]));
+  const artists=(evidence?.artists||[]).map(row=>({...row,epoch_id:epoch.id,window_start:window30.start,window_end:window30.end,coverage_continuous:Boolean(window30.continuous),identity_complete:Boolean(window30.identity_complete),artist:{id:row.artist_id,mbid:row.musicbrainz_artist_mbid||null,name:row.display_name||''}}));
+  const lostAndFound=(evidence?.lost_found||[]).map(row=>{const group=groupById.get(row.release_group_id);return {...row,epoch_id:epoch.id,same_epoch:true,identity_complete:Boolean(group?.musicbrainz_release_group_mbid),release_group:{id:row.release_group_id,mbid:group?.musicbrainz_release_group_mbid||null,title:group?.display_title||'',artist:group?.music_artists?.display_name||''}};});
+  return {periods:periods||[],nightShift:artists,allRoads:artists,timeTraveler:{epoch_id:epoch.id,window_start:window30.start,window_end:window30.end,coverage_continuous:Boolean(window30.continuous),identity_complete:Boolean(window30.identity_complete),decade_tracks:evidence?.decade_tracks||{}},fromDusk:{epoch_id:epoch.id,timezone:epoch.timezone,window_start:window60.start,window_end:window60.end,coverage_continuous:Boolean(window60.continuous),hour_counts:evidence?.hour_counts||{}},lostAndFound};
+}
 async function refreshListeningRecords(username, input) {
   const artist=(input.artists||[])[0], album=(input.releaseGroups||[])[0], track=(input.trackCounts||[])[0];
   const hourRows=await sb(`listening_hour_totals?user_id=eq.${encodeURIComponent(username)}&select=local_hour,scrobble_count&order=scrobble_count.desc&limit=24`);
@@ -1480,12 +1545,13 @@ async function refreshListeningRecords(username, input) {
 }
 async function evaluateListeningAchievements(username, source='lastfm_sync') {
   await ensureAchievementDefinitions();
-  const input=await listeningEvaluationInput(username), evaluation=ListeningRules.evaluate(input);
-  await writeProgress(username,evaluation.progress);
+  const [input,temporalInput]=await Promise.all([listeningEvaluationInput(username),temporalListeningEvaluationInput(username)]), evaluation=ListeningRules.evaluate(input),temporal=TemporalListeningRules.evaluate(temporalInput);
+  await writeProgress(username,[...evaluation.progress,...temporal.progress]);
   await refreshListeningRecords(username,input);
-  const listeningUnlocks=await persistAchievementCandidates(username,evaluation.candidates,source,new Date().toISOString());
+  const listeningUnlocks=await persistAchievementCandidates(username,[...evaluation.candidates,...temporal.candidates],source,new Date().toISOString());
   const hybridUnlocks=await evaluateHybridAchievements(username,source);
-  return [...listeningUnlocks,...hybridUnlocks];
+  const all=[...listeningUnlocks,...hybridUnlocks]; if(all.length){await syncCosmeticEntitlements(username);await refreshEmblemState(username);}
+  return all;
 }
 
 function eventAlbumId(event) { return String(event?.payload?.album_id||AchievementRules.albumId(event?.payload?.album)||''); }
@@ -1749,6 +1815,7 @@ async function processAchievementEvent(username, eventId) {
   await refreshRatingRecords(username, eligibleEvents);
   const allUnlocks=[...unlocks,...discoveryUnlocks,...hybridUnlocks];
   await sb(`vault_achievement_events?event_id=eq.${eventId}`,{method:'PATCH',headers:{Prefer:'return=minimal'},body:JSON.stringify({processed_at:new Date().toISOString(),unlock_ids:allUnlocks.map(u=>u.id)})});
+  if(allUnlocks.length){await syncCosmeticEntitlements(username);await refreshEmblemState(username);}
   return allUnlocks;
 }
 async function processAchievementEvents(username, eventIds) {
@@ -1756,16 +1823,19 @@ async function processAchievementEvents(username, eventIds) {
 }
 async function achievementReadModel(username) {
   await ensureAchievementDefinitions();
-  const [defs,progress,artistProgress,unlocks,showcase,records,inbox,state] = await Promise.all([
+  await Promise.all([syncCosmeticEntitlements(username),refreshAchievementPrevalence(username)]);
+  const [defs,progress,artistProgress,unlocks,showcase,records,inbox,state,emblem,entitlements,cosmeticState,prevalence] = await Promise.all([
     sb('vault_achievement_definitions?enabled=eq.true&order=key.asc'), sb(`vault_achievement_progress?user_id=eq.${encodeURIComponent(username)}`),
     sb(`vault_artist_achievement_progress?user_id=eq.${encodeURIComponent(username)}&order=current_value.desc`),
     sb(`vault_achievement_unlocks?user_id=eq.${encodeURIComponent(username)}&select=id,achievement_key,level,unlocked_at,source,public_visible,snapshot&order=unlocked_at.desc`),
     sb(`vault_achievement_showcase?user_id=eq.${encodeURIComponent(username)}&order=position.asc`), sb(`vault_personal_records?user_id=eq.${encodeURIComponent(username)}`),
-    sb(`vault_achievement_inbox?user_id=eq.${encodeURIComponent(username)}&delivered_at=is.null&order=created_at.asc`), sb(`vault_achievement_state?user_id=eq.${encodeURIComponent(username)}&select=achievement_tracking_started_at&limit=1`)
+    sb(`vault_achievement_inbox?user_id=eq.${encodeURIComponent(username)}&delivered_at=is.null&order=created_at.asc`), sb(`vault_achievement_state?user_id=eq.${encodeURIComponent(username)}&select=achievement_tracking_started_at&limit=1`),
+    refreshEmblemState(username),sb(`vault_cosmetic_entitlements?user_id=eq.${encodeURIComponent(username)}&select=cosmetic_key,source_achievement_key,granted_at,metadata&order=granted_at.asc`),sb(`vault_cosmetic_state?user_id=eq.${encodeURIComponent(username)}&select=equipped_key&limit=1`),sb('vault_achievement_prevalence?display_enabled=eq.true&eligible_population=gte.30&select=achievement_key,eligible_population,unlocked_population,percentage,calculated_at')
   ]);
   const safe=achievementTrustBoundary({definitions:defs,progress,artistProgress,unlocks,showcase,inbox});
   const unlockedKeys=new Set(safe.unlocks.map(u=>u.achievement_key));
-  return { ...safe, records, trackingStartedAt:state?.[0]?.achievement_tracking_started_at || null, unlockedFamilies:unlockedKeys.size };
+  const visibleKeys=new Set(safe.definitions.map(row=>row.key));
+  return { ...safe, records, emblem, cosmetics:{entitlements,available:COSMETIC_REWARDS.map(({key,title})=>({key,title})).filter(row=>entitlements.some(item=>item.cosmetic_key===row.key)),equipped:cosmeticState?.[0]?.equipped_key||null},prevalence:(prevalence||[]).filter(row=>visibleKeys.has(row.achievement_key)),trackingStartedAt:state?.[0]?.achievement_tracking_started_at || null, unlockedFamilies:unlockedKeys.size };
 }
 
 // ── Migración única de portadas de Vault ──
@@ -2101,6 +2171,19 @@ app.post('/achievements/activate', express.json(), async (req,res) => {
 app.post('/achievements/me', express.json(), async (req,res) => {
   try { const username=await verifyToken(req.body?.token); if(!username) return res.status(401).json({error:'Sesión inválida o expirada'}); if(!isAchievementBetaUser(username)) return res.json({ok:true,beta:false}); scheduleIdentityResolution(username); res.json({ok:true,...(await achievementReadModel(username))}); }
   catch(err) { console.error('[achievement read]',err.message); res.status(500).json({error:'No se pudieron leer los achievements'}); }
+});
+app.post('/achievements/emblem/acknowledge', express.json(), async (req,res) => {
+  try { const username=await verifyToken(req.body?.token); if(!username)return res.status(401).json({error:'Sesión inválida o expirada'}); if(!isAchievementBetaUser(username))return res.status(403).json({error:'Achievement Vault está en beta privada'}); await acknowledgePendingEmblem(username); res.json({ok:true,...await achievementReadModel(username)}); }
+  catch(error){console.error('[emblem acknowledge]',error.message);res.status(500).json({error:'No se pudo confirmar el Vault Emblem'});}
+});
+app.post('/achievements/cosmetics/equip', express.json(), async (req,res) => {
+  try {
+    const username=await verifyToken(req.body?.token); if(!username)return res.status(401).json({error:'Sesión inválida o expirada'}); if(!isAchievementBetaUser(username))return res.status(403).json({error:'Achievement Vault está en beta privada'});
+    const key=req.body?.key===null?null:String(req.body?.key||'');
+    if(key){const owned=await sb(`vault_cosmetic_entitlements?user_id=eq.${encodeURIComponent(username)}&cosmetic_key=eq.${encodeURIComponent(key)}&select=cosmetic_key&limit=1`);if(!owned?.length)return res.status(400).json({error:'Cosmetic no disponible'});}
+    await sb('vault_cosmetic_state?on_conflict=user_id',{method:'POST',headers:{Prefer:'resolution=merge-duplicates,return=minimal'},body:JSON.stringify({user_id:username,equipped_key:key||null,updated_at:new Date().toISOString()})});
+    res.json({ok:true,equipped:key||null});
+  } catch(error){console.error('[cosmetic equip]',error.message);res.status(500).json({error:'No se pudo equipar el cosmetic'});}
 });
 
 // Private beta diagnostics: no raw MBID is accepted from the client and this
