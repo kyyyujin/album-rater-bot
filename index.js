@@ -966,9 +966,10 @@ async function emblemEvaluationInput(username) {
 }
 async function refreshEmblemState(username) {
   const evaluation=EmblemRules.evaluate(await emblemEvaluationInput(username));
-  const upgrades=await sb(`vault_emblem_upgrades?user_id=eq.${encodeURIComponent(username)}&select=tier_level,tier_key,evidence,eligible_at,acknowledged_at&order=tier_level.asc`),currentLevel=Math.max(0,...(upgrades||[]).map(row=>Number(row.tier_level)));
+  const [upgrades,stateRows]=await Promise.all([sb(`vault_emblem_upgrades?user_id=eq.${encodeURIComponent(username)}&select=tier_level,tier_key,evidence,eligible_at,acknowledged_at&order=tier_level.asc`),sb(`vault_emblem_state?user_id=eq.${encodeURIComponent(username)}&select=current_level,pending_level,pending_snapshot&limit=1`)]),currentLevel=Math.max(0,...(upgrades||[]).map(row=>Number(row.tier_level)));
   const next=EmblemRules.TIERS.find(tier=>tier.level===currentLevel+1),pending=next&&evaluation.qualified.some(tier=>tier.level===next.level)?next:null,now=new Date().toISOString();
-  const pendingSnapshot=pending?{tier:{id:pending.id,level:pending.level,title:pending.title},metrics:evaluation.metrics,evidence_version:1,rule_version:1,eligible_at:now}:null;
+  const existing=stateRows?.[0],eligibleAt=Number(existing?.pending_level)===pending?.level&&existing?.pending_snapshot?.eligible_at?existing.pending_snapshot.eligible_at:now;
+  const pendingSnapshot=pending?{tier:{id:pending.id,level:pending.level,title:pending.title},metrics:evaluation.metrics,evidence_version:1,rule_version:1,eligible_at:eligibleAt}:null;
   await sb('vault_emblem_state?on_conflict=user_id',{method:'POST',headers:{Prefer:'resolution=merge-duplicates,return=minimal'},body:JSON.stringify({user_id:username,current_level:currentLevel,pending_level:pending?.level||null,pending_snapshot:pendingSnapshot,progress:{metrics:evaluation.metrics,highest_qualified:evaluation.highestQualified?.level||0},evaluated_at:now,updated_at:now})});
   return {currentLevel,pending:pendingSnapshot,progress:{metrics:evaluation.metrics,highestQualified:evaluation.highestQualified?.level||0},upgrades:upgrades||[],tiers:EmblemRules.TIERS.map(({id,level,title,requirements})=>({id,level,title,requirements}))};
 }
@@ -1550,7 +1551,7 @@ async function evaluateListeningAchievements(username, source='lastfm_sync') {
   await refreshListeningRecords(username,input);
   const listeningUnlocks=await persistAchievementCandidates(username,[...evaluation.candidates,...temporal.candidates],source,new Date().toISOString());
   const hybridUnlocks=await evaluateHybridAchievements(username,source);
-  const all=[...listeningUnlocks,...hybridUnlocks]; if(all.length){await syncCosmeticEntitlements(username);await refreshEmblemState(username);}
+  const all=[...listeningUnlocks,...hybridUnlocks]; if(all.length)await syncCosmeticEntitlements(username); await refreshEmblemState(username);
   return all;
 }
 
