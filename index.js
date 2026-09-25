@@ -983,6 +983,8 @@ async function acknowledgePendingEmblem(username) {
 async function refreshAchievementPrevalence(username) {
   // The current rollout has one eligible beta account. Cache the real cohort,
   // but never display percentages until the approved k=30 privacy threshold.
+  const freshSince=new Date(Date.now()-23*60*60*1000).toISOString(),fresh=await sb(`vault_achievement_prevalence?calculated_at=gte.${encodeURIComponent(freshSince)}&select=achievement_key&limit=1`);
+  if(fresh?.length)return;
   const [definitions,unlocks,state]=await Promise.all([
     sb('vault_achievement_definitions?enabled=eq.true&is_discovery=eq.false&select=key'),
     sb(`vault_achievement_unlocks?user_id=eq.${encodeURIComponent(username)}&select=achievement_key`),
@@ -1551,7 +1553,7 @@ async function evaluateListeningAchievements(username, source='lastfm_sync') {
   await refreshListeningRecords(username,input);
   const listeningUnlocks=await persistAchievementCandidates(username,[...evaluation.candidates,...temporal.candidates],source,new Date().toISOString());
   const hybridUnlocks=await evaluateHybridAchievements(username,source);
-  const all=[...listeningUnlocks,...hybridUnlocks]; if(all.length)await syncCosmeticEntitlements(username); await refreshEmblemState(username);
+  const all=[...listeningUnlocks,...hybridUnlocks]; if(all.length)await syncCosmeticEntitlements(username); await Promise.all([refreshEmblemState(username),refreshAchievementPrevalence(username)]);
   return all;
 }
 
