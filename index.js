@@ -2105,7 +2105,7 @@ app.post('/work-in-progress/get', express.json(), async (req, res) => {
 // Una colección grande (cientos de álbumes con tracks/reseñas) supera con
 // facilidad el límite por defecto de Express (100 KB). El límite sigue siendo
 // acotado para no permitir cuerpos arbitrarios en memoria.
-app.post('/vault-collection', express.json({ limit: '2mb' }), async (req, res) => {
+app.post('/vault-collection', express.json({ limit: '8mb' }), async (req, res) => {
   try {
     const { token, collection } = req.body;
     const username = await verifyToken(token);
@@ -2133,7 +2133,7 @@ app.post('/vault-collection/get', express.json(), async (req, res) => {
 
 // Phase 1 achievement events share the collection write through an RPC transaction.
 // The client may request a fact to be evaluated, but the server derives every unlock.
-app.post('/vault-collection/events', express.json({ limit: '2mb' }), async (req, res) => {
+app.post('/vault-collection/events', express.json({ limit: '8mb' }), async (req, res) => {
   try {
     const { token, collection, events } = req.body;
     const username = await verifyToken(token);
