@@ -893,7 +893,11 @@ let achievementDefinitionsReady = false;
 const ALL_ACHIEVEMENT_DEFINITIONS = [...AchievementRules.DEFINITIONS,...DiscoveryRules.DEFINITIONS];
 async function ensureAchievementDefinitions() {
   if (achievementDefinitionsReady) return;
-  const rows = ALL_ACHIEVEMENT_DEFINITIONS.map(d => ({ key:d.key,title:d.title,category:d.category,rarity:d.rarity,max_level:d.maxLevel,rule_version:d.ruleVersion,enabled:d.enabled!==false,is_secret:Boolean(d.metadata?.secret),is_discovery:Boolean(d.metadata?.discovery),emblem_eligible:d.metadata?.emblemEligible!==false,client_metadata:{ badge:d.key, ...(d.metadata || {}) } }));
+  const rows = ALL_ACHIEVEMENT_DEFINITIONS.map(d => {
+    const isSecret=Boolean(d.metadata?.secret), isDiscovery=Boolean(d.metadata?.discovery), clientMetadata={badge:d.key,...(d.metadata||{})};
+    if(isSecret||isDiscovery)delete clientMetadata.description;
+    return {key:d.key,title:d.title,category:d.category,rarity:d.rarity,max_level:d.maxLevel,rule_version:d.ruleVersion,enabled:d.enabled!==false,is_secret:isSecret,is_discovery:isDiscovery,emblem_eligible:d.metadata?.emblemEligible!==false,client_metadata:clientMetadata};
+  });
   await sb('vault_achievement_definitions?on_conflict=key', { method:'POST', headers:{ Prefer:'resolution=merge-duplicates,return=minimal' }, body:JSON.stringify(rows) });
   achievementDefinitionsReady = true;
 }
