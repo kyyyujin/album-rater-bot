@@ -2624,6 +2624,23 @@ app.use((err, req, res, next) => {
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => {
   console.log(`Server running on port ${PORT}`);
+  // Temporary read-only check before routing real posts through Supabase.
+  setTimeout(async () => {
+    try {
+      const result = await fetch(`${SUPABASE_URL}/functions/v1/discord-post-relay`, {
+        headers: {
+          Authorization: `Bearer ${SUPABASE_KEY}`,
+          apikey: SUPABASE_KEY,
+          'x-discord-bot-token': BOT_TOKEN
+        },
+        timeout: 12000
+      });
+      const data = await result.json();
+      console.log('[relay-readonly-probe]', JSON.stringify({ relay_status: result.status, discord_status: data.discord_status || null }));
+    } catch (error) {
+      console.warn('[relay-readonly-probe]', JSON.stringify({ error: error.name || 'fetch_error' }));
+    }
+  }, 1000);
   // Corre después de que Render marque el proceso como disponible.
   setTimeout(() => { runVaultCoverQualityMigration(); }, 3000);
   // Phase 1.5 backfill is bounded, persisted and restartable. It resolves
