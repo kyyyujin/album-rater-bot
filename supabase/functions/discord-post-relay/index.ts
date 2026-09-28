@@ -1,6 +1,8 @@
 // The browser never calls this function. Render authenticates the user and
 // looks up the saved thread before forwarding the image and bot credential.
 const MAX_IMAGE_BYTES = 8 * 1024 * 1024;
+// SHA-256 of a separate 256-bit relay credential stored only in Render.
+const RELAY_KEY_HASH = '7ad5f700b1f876eaf31c8e04ec27f04126797e88ce4aa245c0d4ebbb3d50a7c7';
 const RATE_HEADERS = [
   'date', 'retry-after', 'x-ratelimit-limit', 'x-ratelimit-remaining',
   'x-ratelimit-reset', 'x-ratelimit-reset-after', 'x-ratelimit-bucket',
@@ -28,9 +30,11 @@ function relayError(status: number, error: string): Response {
 }
 
 Deno.serve(async (request: Request) => {
-  const expected = Deno.env.get('SUPABASE_SERVICE_ROLE_KEY') || '';
-  const provided = request.headers.get('authorization')?.replace(/^Bearer /i, '') || '';
-  if (!equalSecret(provided, expected)) return relayError(403, 'Forbidden');
+  const provided = request.headers.get('x-discord-relay-key') || '';
+  if (!/^[a-f0-9]{64}$/.test(provided)) return relayError(403, 'Forbidden');
+  const digest = await crypto.subtle.digest('SHA-256', new TextEncoder().encode(provided));
+  const actualHash = Array.from(new Uint8Array(digest), byte => byte.toString(16).padStart(2, '0')).join('');
+  if (!equalSecret(actualHash, RELAY_KEY_HASH)) return relayError(403, 'Forbidden');
 
   const botToken = request.headers.get('x-discord-bot-token');
   if (!botToken) return relayError(400, 'Missing bot credential');
