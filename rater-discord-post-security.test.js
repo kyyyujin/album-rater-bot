@@ -22,11 +22,11 @@ assert.doesNotMatch(postRoute, /req\.body\??\.user_id|req\.body\.user_id/, 'POST
 assert.doesNotMatch(postRoute, /const\s*\{[^}]*\bthread_id\b[^}]*\}\s*=\s*req\.body/, 'POST /post must not destructure a browser thread_id');
 assert.doesNotMatch(postRoute, /const\s*\{[^}]*\buser_id\b[^}]*\}\s*=\s*req\.body/, 'POST /post must not destructure a browser user_id');
 assert.match(postRoute, /functions\/v1\/discord-post-relay/, 'the server must send via the separate egress');
-assert.match(postRoute, /Bearer \$\{SUPABASE_KEY\}/, 'the relay must receive server-side authentication');
+assert.match(postRoute, /x-discord-relay-key': DISCORD_RELAY_KEY/, 'the relay must receive its dedicated server credential');
 assert.match(postRoute, /x-discord-thread-id': thread_id/, 'only the saved thread reaches the relay');
 assert.doesNotMatch(postRoute, /discord\.com\/api/, 'the post route must not depend on Render egress to Discord');
-assert.match(relay, /SUPABASE_SERVICE_ROLE_KEY/, 'the relay must require the privileged server key');
-assert.match(relay, /equalSecret\(provided, expected\)/, 'the relay must authenticate before any Discord request');
+assert.match(relay, /RELAY_KEY_HASH/, 'the relay must bind a dedicated credential hash');
+assert.match(relay, /equalSecret\(actualHash, RELAY_KEY_HASH\)/, 'the relay must authenticate before any Discord request');
 assert.match(relay, /MAX_IMAGE_BYTES/, 'the relay must bound image payloads');
 assert.match(migration, /create table if not exists public\.rater_discord_settings/i, 'settings migration must exist');
 assert.match(migration, /enable row level security/i, 'settings must have RLS enabled');
