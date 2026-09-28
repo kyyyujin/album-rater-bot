@@ -1,7 +1,6 @@
 const express   = require('express');
 const multer    = require('multer');
 const fetch     = require('node-fetch');
-const FormData  = require('form-data');
 const sharp     = require('sharp');
 const puppeteer = require('puppeteer');
 const { Client, GatewayIntentBits, EmbedBuilder } = require('discord.js');
@@ -32,6 +31,7 @@ const upload = multer({
 });
 
 const BOT_TOKEN    = process.env.BOT_TOKEN;
+const DISCORD_RELAY_KEY = process.env.DISCORD_RELAY_KEY;
 const SUPABASE_URL = process.env.SUPABASE_URL;
 const SUPABASE_KEY = process.env.SUPABASE_KEY;
 const LASTFM_API_KEY = process.env.LASTFM_API_KEY;
@@ -511,17 +511,25 @@ app.post('/post', upload.single('file'), async (req, res) => {
     const thread_id = await getRaterDiscordThreadId(username);
     if (!thread_id) return res.status(409).json({ error: 'Configurá y guardá tu Thread ID de Discord antes de enviar.' });
 
-    const form = new FormData();
-    form.append('payload_json', JSON.stringify({ attachments: [{ id: '0', filename: 'rating.png' }] }), { contentType: 'application/json' });
-    form.append('files[0]', req.file.buffer, { filename: 'rating.png', contentType: 'image/png' });
-
-    const discordRes = await fetch(`https://discord.com/api/v10/channels/${thread_id}/messages`, {
+    // Only the server can call the relay. The browser cannot choose the thread,
+    // supply the bot credential, or reach the Discord API from this route.
+    const discordRes = await fetch(`${SUPABASE_URL}/functions/v1/discord-post-relay`, {
       method: 'POST',
-      headers: { 'Authorization': `Bot ${BOT_TOKEN}`, ...form.getHeaders() },
-      body: form
+      headers: {
+        'x-discord-relay-key': DISCORD_RELAY_KEY,
+        'x-discord-bot-token': BOT_TOKEN,
+        'x-discord-thread-id': thread_id,
+        'Content-Type': 'image/png'
+      },
+      body: req.file.buffer,
+      timeout: 30000
     });
     let discordData = {};
     try { discordData = await discordRes.json(); } catch (_) {}
+    if (discordRes.headers.get('x-discord-relay-result') !== 'discord') {
+      console.error('[discord-post-relay]', JSON.stringify({ status: discordRes.status, error: discordData?.error || 'relay_error' }));
+      return res.status(502).json({ error: 'No se pudo completar el envío a Discord.', code: 'discord_relay_unavailable' });
+    }
     if (!discordRes.ok) {
       const failure = discordPostFailure(discordRes, discordData);
       console.warn('[discord-post]', JSON.stringify({
@@ -2624,22 +2632,6 @@ app.use((err, req, res, next) => {
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => {
   console.log(`Server running on port ${PORT}`);
-  // Temporary read-only check before routing real posts through Supabase.
-  setTimeout(async () => {
-    try {
-      const result = await fetch(`${SUPABASE_URL}/functions/v1/discord-post-relay`, {
-        headers: {
-          'x-discord-relay-key': process.env.DISCORD_RELAY_KEY,
-          'x-discord-bot-token': BOT_TOKEN
-        },
-        timeout: 12000
-      });
-      const data = await result.json();
-      console.log('[relay-readonly-probe]', JSON.stringify({ relay_status: result.status, discord_status: data.discord_status || null }));
-    } catch (error) {
-      console.warn('[relay-readonly-probe]', JSON.stringify({ error: error.name || 'fetch_error' }));
-    }
-  }, 1000);
   // Corre después de que Render marque el proceso como disponible.
   setTimeout(() => { runVaultCoverQualityMigration(); }, 3000);
   // Phase 1.5 backfill is bounded, persisted and restartable. It resolves
