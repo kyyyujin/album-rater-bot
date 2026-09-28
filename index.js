@@ -1,7 +1,6 @@
 const express   = require('express');
 const multer    = require('multer');
 const fetch     = require('node-fetch');
-const FormData  = require('form-data');
 const sharp     = require('sharp');
 const puppeteer = require('puppeteer');
 const { Client, GatewayIntentBits, EmbedBuilder } = require('discord.js');
@@ -511,17 +510,26 @@ app.post('/post', upload.single('file'), async (req, res) => {
     const thread_id = await getRaterDiscordThreadId(username);
     if (!thread_id) return res.status(409).json({ error: 'Configurá y guardá tu Thread ID de Discord antes de enviar.' });
 
-    const form = new FormData();
-    form.append('payload_json', JSON.stringify({ attachments: [{ id: '0', filename: 'rating.png' }] }), { contentType: 'application/json' });
-    form.append('files[0]', req.file.buffer, { filename: 'rating.png', contentType: 'image/png' });
-
-    const discordRes = await fetch(`https://discord.com/api/v10/channels/${thread_id}/messages`, {
+    // Only the server can call the relay. The browser cannot choose the thread,
+    // supply the bot credential, or reach the Discord API from this route.
+    const discordRes = await fetch(`${SUPABASE_URL}/functions/v1/discord-post-relay`, {
       method: 'POST',
-      headers: { 'Authorization': `Bot ${BOT_TOKEN}`, ...form.getHeaders() },
-      body: form
+      headers: {
+        'Authorization': `Bearer ${SUPABASE_KEY}`,
+        'apikey': SUPABASE_KEY,
+        'x-discord-bot-token': BOT_TOKEN,
+        'x-discord-thread-id': thread_id,
+        'Content-Type': 'image/png'
+      },
+      body: req.file.buffer,
+      timeout: 30000
     });
     let discordData = {};
     try { discordData = await discordRes.json(); } catch (_) {}
+    if (discordRes.headers.get('x-discord-relay-result') !== 'discord') {
+      console.error('[discord-post-relay]', JSON.stringify({ status: discordRes.status, error: discordData?.error || 'relay_error' }));
+      return res.status(502).json({ error: 'No se pudo completar el envío a Discord.', code: 'discord_relay_unavailable' });
+    }
     if (!discordRes.ok) {
       const failure = discordPostFailure(discordRes, discordData);
       console.warn('[discord-post]', JSON.stringify({
