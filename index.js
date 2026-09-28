@@ -529,10 +529,14 @@ app.post('/post', upload.single('file'), async (req, res) => {
         user: username,
         discord_status: discordRes.status,
         code: failure.code,
+        discord_code: failure.discord_code,
+        discord_message: failure.discord_message,
         retry_after_seconds: failure.retry_after_seconds,
+        blocked_until: failure.blocked_until,
         scope: failure.scope,
         global: failure.global,
-        bucket: failure.bucket
+        bucket: failure.bucket,
+        rate_limit_headers: failure.rate_limit_headers
       }));
       if (failure.retry_after_seconds !== null && failure.retry_after_seconds !== undefined) {
         res.set('Retry-After', String(failure.retry_after_seconds));

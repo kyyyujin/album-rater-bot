@@ -6,6 +6,7 @@ function normalizeDiscordThreadId(value) {
 }
 
 function numberOrNull(value) {
+  if (value === null || value === undefined || value === '') return null;
   const parsed = Number(value);
   return Number.isFinite(parsed) && parsed >= 0 ? parsed : null;
 }
@@ -13,11 +14,29 @@ function numberOrNull(value) {
 function discordRateLimitMetadata(response, payload = {}) {
   const header = name => response?.headers?.get?.(name) || null;
   const retryAfterSeconds = numberOrNull(payload?.retry_after) ?? numberOrNull(header('retry-after'));
+  const responseDate = header('date');
+  const responseDateMs = Date.parse(responseDate || '');
+  const blockedUntilMs = retryAfterSeconds === null
+    ? null
+    : (Number.isFinite(responseDateMs) ? responseDateMs : Date.now()) + retryAfterSeconds * 1000;
   return {
     retry_after_seconds: retryAfterSeconds,
+    blocked_until: blockedUntilMs === null ? null : new Date(blockedUntilMs).toISOString(),
     scope: header('x-ratelimit-scope') || null,
     global: payload?.global === true || header('x-ratelimit-global') === 'true',
-    bucket: header('x-ratelimit-bucket') || null
+    bucket: header('x-ratelimit-bucket') || null,
+    discord_code: numberOrNull(payload?.code),
+    discord_message: typeof payload?.message === 'string' ? payload.message.slice(0, 500) : null,
+    rate_limit_headers: {
+      retry_after: header('retry-after'),
+      limit: header('x-ratelimit-limit'),
+      remaining: header('x-ratelimit-remaining'),
+      reset: header('x-ratelimit-reset'),
+      reset_after: header('x-ratelimit-reset-after'),
+      bucket: header('x-ratelimit-bucket'),
+      global: header('x-ratelimit-global'),
+      scope: header('x-ratelimit-scope')
+    }
   };
 }
 
