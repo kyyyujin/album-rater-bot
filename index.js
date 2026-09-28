@@ -2629,8 +2629,7 @@ app.listen(PORT, () => {
     try {
       const result = await fetch(`${SUPABASE_URL}/functions/v1/discord-post-relay`, {
         headers: {
-          Authorization: `Bearer ${SUPABASE_KEY}`,
-          apikey: SUPABASE_KEY,
+          'x-discord-relay-key': process.env.DISCORD_RELAY_KEY,
           'x-discord-bot-token': BOT_TOKEN
         },
         timeout: 12000
