@@ -8,6 +8,7 @@ const root = __dirname;
 const backend = fs.readFileSync(path.join(root, 'index.js'), 'utf8');
 const frontend = fs.readFileSync(path.join(root, '..', 'Rater-Page', 'index.html'), 'utf8');
 const migration = fs.readFileSync(path.join(root, 'migrations', '20260918003000_rater_discord_post_security.sql'), 'utf8');
+const relay = fs.readFileSync(path.join(root, 'supabase', 'functions', 'discord-post-relay', 'index.ts'), 'utf8');
 
 const postStart = backend.indexOf("app.post('/post'");
 const postEnd = backend.indexOf("app.post('/delete'", postStart);
@@ -20,6 +21,13 @@ assert.doesNotMatch(postRoute, /req\.body\??\.thread_id|req\.body\.thread_id/, '
 assert.doesNotMatch(postRoute, /req\.body\??\.user_id|req\.body\.user_id/, 'POST /post must not read a browser user_id');
 assert.doesNotMatch(postRoute, /const\s*\{[^}]*\bthread_id\b[^}]*\}\s*=\s*req\.body/, 'POST /post must not destructure a browser thread_id');
 assert.doesNotMatch(postRoute, /const\s*\{[^}]*\buser_id\b[^}]*\}\s*=\s*req\.body/, 'POST /post must not destructure a browser user_id');
+assert.match(postRoute, /functions\/v1\/discord-post-relay/, 'the server must send via the separate egress');
+assert.match(postRoute, /Bearer \$\{SUPABASE_KEY\}/, 'the relay must receive server-side authentication');
+assert.match(postRoute, /x-discord-thread-id': thread_id/, 'only the saved thread reaches the relay');
+assert.doesNotMatch(postRoute, /discord\.com\/api/, 'the post route must not depend on Render egress to Discord');
+assert.match(relay, /SUPABASE_SERVICE_ROLE_KEY/, 'the relay must require the privileged server key');
+assert.match(relay, /equalSecret\(provided, expected\)/, 'the relay must authenticate before any Discord request');
+assert.match(relay, /MAX_IMAGE_BYTES/, 'the relay must bound image payloads');
 assert.match(migration, /create table if not exists public\.rater_discord_settings/i, 'settings migration must exist');
 assert.match(migration, /enable row level security/i, 'settings must have RLS enabled');
 assert.match(migration, /revoke all on table public\.rater_discord_settings from anon, authenticated/i, 'browser roles must have no table grants');
