@@ -2624,23 +2624,6 @@ app.use((err, req, res, next) => {
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => {
   console.log(`Server running on port ${PORT}`);
-  // Temporary read-only egress diagnostic; no bot token or Discord messages.
-  setTimeout(async () => {
-    try {
-      const response = await fetch('https://discord.com/api/v10/gateway', {
-        headers: { 'User-Agent': 'AlbumVaultEgressDiagnostic/1.0' },
-        signal: AbortSignal.timeout(8000)
-      });
-      console.log('[discord-egress-probe]', JSON.stringify({
-        status: response.status,
-        date: response.headers.get('date'),
-        cf_ray: response.headers.get('cf-ray'),
-        retry_after: response.headers.get('retry-after')
-      }));
-    } catch (error) {
-      console.warn('[discord-egress-probe]', JSON.stringify({ error: error.name || 'fetch_error' }));
-    }
-  }, 1000);
   // Corre después de que Render marque el proceso como disponible.
   setTimeout(() => { runVaultCoverQualityMigration(); }, 3000);
   // Phase 1.5 backfill is bounded, persisted and restartable. It resolves
