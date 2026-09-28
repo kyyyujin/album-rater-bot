@@ -31,6 +31,7 @@ const upload = multer({
 });
 
 const BOT_TOKEN    = process.env.BOT_TOKEN;
+const DISCORD_RELAY_KEY = process.env.DISCORD_RELAY_KEY;
 const SUPABASE_URL = process.env.SUPABASE_URL;
 const SUPABASE_KEY = process.env.SUPABASE_KEY;
 const LASTFM_API_KEY = process.env.LASTFM_API_KEY;
@@ -515,8 +516,7 @@ app.post('/post', upload.single('file'), async (req, res) => {
     const discordRes = await fetch(`${SUPABASE_URL}/functions/v1/discord-post-relay`, {
       method: 'POST',
       headers: {
-        'Authorization': `Bearer ${SUPABASE_KEY}`,
-        'apikey': SUPABASE_KEY,
+        'x-discord-relay-key': DISCORD_RELAY_KEY,
         'x-discord-bot-token': BOT_TOKEN,
         'x-discord-thread-id': thread_id,
         'Content-Type': 'image/png'
