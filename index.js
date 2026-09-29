@@ -846,9 +846,11 @@ app.get('/covers', async (req, res) => {
     const shuffled = covers.sort(() => Math.random() - 0.5).slice(0, 40);
     if (mobileQuality && shuffled.length) {
       const original = shuffled[0];
-      const artwork = await resolveMobileHeroCover(data.find(row => row.cover_url === original));
+      const album = data.find(row => row.cover_url === original);
+      const artwork = await resolveMobileHeroCover(album);
       return res.json({ covers: shuffled, heroCover: artwork.cover,
-        heroOriginalCover: original, heroCoverSource: artwork.source });
+        heroOriginalCover: original, heroCoverSource: artwork.source,
+        heroAlbum: { title: album.album_title || '', artist: album.artist || '' } });
     }
     res.json({ covers: shuffled });
   } catch(err) {
