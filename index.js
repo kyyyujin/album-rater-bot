@@ -780,14 +780,76 @@ app.post('/update-rating', express.json(), async (req, res) => {
 });
 
 // ── Public: random covers for login bg ──
+// Optional mobile hero lookup. Never persist provider replacements to ratings.
+const mobileCoverCache = new Map();
+function normalizeMobileCoverIdentity(value) {
+  return String(value || '').normalize('NFKD').replace(/\p{M}/gu, '')
+    .toLowerCase().replace(/[^\p{L}\p{N}]/gu, '');
+}
+
+async function resolveMobileHeroCover(row) {
+  const fallback = { cover: row?.cover_url || '', source: 'database' };
+  if (!row?.album_title || !row?.artist || !fallback.cover) return fallback;
+  const size = fallback.cover.match(/\/(\d+)x(\d+)(?:bb|[-/])/);
+  if (size && Math.min(Number(size[1]), Number(size[2])) >= 1000) return fallback;
+  const title = normalizeMobileCoverIdentity(row.album_title);
+  const artist = normalizeMobileCoverIdentity(row.artist);
+  if (!title || !artist) return fallback;
+  const key = JSON.stringify([title, artist]);
+  const cached = mobileCoverCache.get(key);
+  if (cached && cached.expires > Date.now()) {
+    const cover = await cached.task;
+    return cover ? { cover, source: 'deezer' } : fallback;
+  }
+  const entry = { expires: Date.now() + 600000, task: null };
+  entry.task = (async () => {
+    try {
+      const quote = value => String(value).replace(/["\\]/g, ' ').slice(0, 180);
+      const query = `artist:"${quote(row.artist)}" album:"${quote(row.album_title)}"`;
+      const response = await fetch(`https://api.deezer.com/search/album?q=${encodeURIComponent(query)}&limit=25`, {
+        timeout: 3500, size: 1024 * 1024, headers: { Accept: 'application/json' }
+      });
+      if (!response.ok) return '';
+      const result = await response.json();
+      if (!Array.isArray(result.data)) return '';
+      const matches = result.data.filter(album =>
+        normalizeMobileCoverIdentity(album.title) === title &&
+        normalizeMobileCoverIdentity(album.artist?.name) === artist
+      ).map(album => album.cover_xl).filter(cover => {
+        try {
+          const url = new URL(cover);
+          return url.protocol === 'https:' && url.hostname.endsWith('.dzcdn.net');
+        } catch (_) { return false; }
+      });
+      const distinct = [...new Set(matches)];
+      // Different artworks for the same title/artist are ambiguous; retain the DB cover.
+      if (distinct.length !== 1) return '';
+      entry.expires = Date.now() + 24 * 60 * 60 * 1000;
+      return distinct[0];
+    } catch (_) { return ''; }
+  })();
+  if (mobileCoverCache.size >= 256) mobileCoverCache.delete(mobileCoverCache.keys().next().value);
+  mobileCoverCache.set(key, entry);
+  const cover = await entry.task;
+  return cover ? { cover, source: 'deezer' } : fallback;
+}
+
 app.get('/covers', async (req, res) => {
   try {
-    const r = await fetch(`${SUPABASE_URL}/rest/v1/ratings?select=cover_url&limit=200&order=created_at.desc`, {
+    const mobileQuality = req.query.quality === 'deezer';
+    const columns = mobileQuality ? 'cover_url,album_title,artist' : 'cover_url';
+    const r = await fetch(`${SUPABASE_URL}/rest/v1/ratings?select=${columns}&limit=200&order=created_at.desc`, {
       headers: { 'apikey': SUPABASE_KEY, 'Authorization': `Bearer ${SUPABASE_KEY}` }
     });
     const data = await r.json();
     const covers = [...new Set(data.map(row => row.cover_url).filter(Boolean))];
     const shuffled = covers.sort(() => Math.random() - 0.5).slice(0, 40);
+    if (mobileQuality && shuffled.length) {
+      const original = shuffled[0];
+      const artwork = await resolveMobileHeroCover(data.find(row => row.cover_url === original));
+      return res.json({ covers: shuffled, heroCover: artwork.cover,
+        heroOriginalCover: original, heroCoverSource: artwork.source });
+    }
     res.json({ covers: shuffled });
   } catch(err) {
     res.status(500).json({ error: err.message });
