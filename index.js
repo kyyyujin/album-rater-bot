@@ -492,7 +492,7 @@ app.post('/render-fast-rating', express.json({ limit: '3mb' }), async (req, res)
     const { token, cardHtml, cssText, fontUrls } = req.body || {};
     const username = await verifyTokenFromStore(token);
     if (!username) return res.status(401).json({ error: 'Sesión inválida o expirada' });
-    if (typeof cardHtml !== 'string' || !/^<div\b[^>]*class="fast-export-card"/.test(cardHtml) || cardHtml.length > 900_000 ||
+    if (typeof cardHtml !== 'string' || !/^<div\b[^>]*class="fast-export-card"/.test(cardHtml) || cardHtml.length > 2_000_000 ||
         /<\/?(?:script|iframe|object|embed|link|meta|base)\b/i.test(cardHtml) || /\son[a-z]+\s*=/i.test(cardHtml)) {
       return res.status(400).json({ error: 'Preview Fast Rate inválida' });
     }
