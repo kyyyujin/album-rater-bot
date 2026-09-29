@@ -471,6 +471,91 @@ ${fontLinks}
   }
 });
 
+// Separate square compositor for Fast Rate. The normal /render-rating contract above
+// stays untouched, including its CSS, dimensions, and screenshot behavior.
+const FAST_RATE_EXPORT_REVISION = 'fast-rate-export-20260929.1';
+app.post('/render-fast-rating', express.json({ limit: '3mb' }), async (req, res) => {
+  const now = Date.now();
+  const ip = req.ip || req.socket.remoteAddress || 'unknown';
+  const recent = (ratingExportRateLimits.get(ip) || []).filter(time => now - time < 60_000);
+  if (recent.length >= 10) return res.status(429).json({ error: 'Demasiadas exportaciones; espera un minuto.' });
+  recent.push(now);
+  ratingExportRateLimits.set(ip, recent);
+  if (ratingExportBusy) {
+    res.set('Retry-After', '8');
+    return res.status(503).json({ error: 'El renderer está terminando otra exportación. Intenta nuevamente en unos segundos.' });
+  }
+  ratingExportBusy = true;
+  let browser = null;
+  let page = null;
+  try {
+    const { token, cardHtml, cssText, fontUrls } = req.body || {};
+    const username = await verifyTokenFromStore(token);
+    if (!username) return res.status(401).json({ error: 'Sesión inválida o expirada' });
+    if (typeof cardHtml !== 'string' || !/^<div\b[^>]*class="fast-export-card"/.test(cardHtml) || cardHtml.length > 900_000 ||
+        /<\/?(?:script|iframe|object|embed|link|meta|base)\b/i.test(cardHtml) || /\son[a-z]+\s*=/i.test(cardHtml)) {
+      return res.status(400).json({ error: 'Preview Fast Rate inválida' });
+    }
+    if (typeof cssText !== 'string' || cssText.length > 100_000 || /<\/style\s*>/i.test(cssText)) {
+      return res.status(400).json({ error: 'Estilos inválidos' });
+    }
+    const safeFonts = Array.isArray(fontUrls)
+      ? fontUrls.filter(url => /^https:\/\/fonts\.googleapis\.com\//i.test(String(url))).slice(0, 4) : [];
+    browser = await launchRatingExportBrowser();
+    page = await browser.newPage();
+    await page.setViewport({ width:1280, height:1280, deviceScaleFactor:1.5 });
+    await page.setRequestInterception(true);
+    page.on('request', request => {
+      if (allowRatingExportRequest(request.url())) request.continue();
+      else request.abort('blockedbyclient');
+    });
+    const fontLinks = safeFonts.map(url => `<link rel="stylesheet" href="${escapeHtmlAttribute(url)}">`).join('');
+    const documentHtml = `<!doctype html><html lang="es"><head><meta charset="utf-8">
+<meta http-equiv="Content-Security-Policy" content="default-src 'none'; img-src data: https:; style-src 'unsafe-inline' https://fonts.googleapis.com; font-src data: https://fonts.gstatic.com; connect-src 'none'; script-src 'none'; object-src 'none';">
+${fontLinks}<style>${cssText}</style><style>
+html,body{margin:0!important;padding:0!important;width:1280px!important;height:1280px!important;overflow:hidden!important;background:transparent!important;}
+#fast-capture-root{width:1280px;height:1280px;margin:0;padding:0;overflow:hidden;}
+#fast-capture-root>.fast-export-card{width:1280px!important;height:1280px!important;transform:none!important;}
+</style></head><body><main id="fast-capture-root">${cardHtml}</main></body></html>`;
+    await page.setContent(documentHtml, { waitUntil:'domcontentloaded', timeout:30_000 });
+    await page.waitForNetworkIdle({ idleTime:350, timeout:10_000 }).catch(() => {});
+    const imageState = await page.evaluate(async () => {
+      if (document.fonts?.ready) await document.fonts.ready;
+      return Promise.all(Array.from(document.images).map(async image => {
+        if (!image.complete) await new Promise(resolve => {
+          image.addEventListener('load', resolve, { once:true });
+          image.addEventListener('error', resolve, { once:true });
+          setTimeout(resolve, 8000);
+        });
+        try { await image.decode(); } catch (_) {}
+        return image.naturalWidth > 0;
+      }));
+    });
+    if (imageState.some(loaded => !loaded)) return res.status(422).json({ error:'No se pudo cargar la portada para la exportación' });
+    await new Promise(resolve => setTimeout(resolve, 300));
+    const card = await page.$('#fast-capture-root > .fast-export-card');
+    const box = await card?.boundingBox();
+    if (!box || box.width !== 1280 || box.height !== 1280) throw new Error('Dimensiones Fast Rate inválidas');
+    let png = Buffer.from(await card.screenshot({ type:'png', omitBackground:true, captureBeyondViewport:true }));
+    await page.close(); page = null;
+    await browser.close(); browser = null;
+    if (png.length > 7 * 1024 * 1024) png = await sharp(png).png({ compressionLevel:9, adaptiveFiltering:true }).toBuffer();
+    res.set('Content-Type', 'image/png');
+    res.set('Cache-Control', 'no-store');
+    res.set('X-Rating-Renderer', 'chromium');
+    res.set('X-Rating-Image-Width', '1920');
+    res.set('X-Fast-Rate-Export-Revision', FAST_RATE_EXPORT_REVISION);
+    res.send(png);
+  } catch (error) {
+    console.error('[render-fast-rating]', error);
+    res.status(500).json({ error:'No se pudo renderizar Fast Rate con Chromium' });
+  } finally {
+    if (page) await page.close().catch(() => {});
+    if (browser) await browser.close().catch(() => { try { browser.process()?.kill('SIGKILL'); } catch (_) {} });
+    ratingExportBusy = false;
+  }
+});
+
 async function changeBotPfp(coverUrl) {
   const now = Date.now();
   if (now - lastPfpChange < PFP_COOLDOWN_MS) { console.log('PFP cooldown'); return; }
