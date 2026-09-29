@@ -150,7 +150,7 @@ client.on('interactionCreate', async interaction => {
         .setColor(0x5865f2)
         .setDescription(ratings.map((r, i) =>
           `**${i+1}.** ${r.album_title}${r.artist ? ` — ${r.artist}` : ''}\n` +
-          `\`${r.final_score || '—'}\` **[${r.final_rank || '—'}]** · ${new Date(r.created_at).toLocaleDateString('es')}`
+          `${r.final_score == null ? '' : `\`${r.final_score}\` `}**[${r.final_rank || '—'}]** · ${new Date(r.created_at).toLocaleDateString('es')}`
         ).join('\n\n'))
         .setFooter({ text: `Últimos ${ratings.length} ratings` });
       await interaction.editReply({ embeds: [embed] });
@@ -177,12 +177,12 @@ client.on('interactionCreate', async interaction => {
       const embed = new EmbedBuilder()
         .setTitle(`🏆 Top ${sorted.length} de ${usuario}`)
         .setColor(0xc8f060)
-        .setDescription(sorted.map((r, i) => {
+        .setDescription(sorted.length ? sorted.map((r, i) => {
           const medals = ['🥇','🥈','🥉'];
           const prefix = medals[i] || `**${i+1}.**`;
           return `${prefix} ${r.album_title}${r.artist ? ` — ${r.artist}` : ''}\n` +
                  `\`${parseFloat(r.final_score).toFixed(2)}\` **[${r.final_rank || '—'}]**`;
-        }).join('\n\n'));
+        }).join('\n\n') : 'No hay álbumes con score numérico.');
       await interaction.editReply({ embeds: [embed] });
     } catch(e) {
       await interaction.editReply('Error al obtener el top.');
@@ -199,7 +199,7 @@ client.on('interactionCreate', async interaction => {
         return;
       }
       const scores = all.map(r => parseFloat(r.final_score)).filter(s => !isNaN(s));
-      const avg    = scores.reduce((a, b) => a + b, 0) / scores.length;
+      const avg    = scores.length ? scores.reduce((a, b) => a + b, 0) / scores.length : null;
       const best   = all.filter(r => r.final_score !== null).sort((a,b) => parseFloat(b.final_score) - parseFloat(a.final_score))[0];
       const worst  = all.filter(r => r.final_score !== null).sort((a,b) => parseFloat(a.final_score) - parseFloat(b.final_score))[0];
 
@@ -216,10 +216,10 @@ client.on('interactionCreate', async interaction => {
         .setColor(0x5865f2)
         .addFields(
           { name: '🎵 Total rateados', value: `${all.length} álbumes`, inline: true },
-          { name: '⭐ Promedio general', value: `\`${avg.toFixed(2)}\``, inline: true },
+          { name: '⭐ Promedio general', value: avg === null ? '—' : `\`${avg.toFixed(2)}\``, inline: true },
           { name: '\u200b', value: '\u200b', inline: true },
-          { name: '🏆 Mejor', value: `${best.album_title}\n\`${parseFloat(best.final_score).toFixed(2)}\` [${best.final_rank}]`, inline: true },
-          { name: '💀 Peor', value: `${worst.album_title}\n\`${parseFloat(worst.final_score).toFixed(2)}\` [${worst.final_rank}]`, inline: true },
+          { name: '🏆 Mejor', value: best ? `${best.album_title}\n\`${parseFloat(best.final_score).toFixed(2)}\` [${best.final_rank}]` : '—', inline: true },
+          { name: '💀 Peor', value: worst ? `${worst.album_title}\n\`${parseFloat(worst.final_score).toFixed(2)}\` [${worst.final_rank}]` : '—', inline: true },
           { name: '\u200b', value: '\u200b', inline: true },
           { name: '📈 Distribución de ranks', value: rankStr || '—' }
         );
@@ -681,8 +681,11 @@ app.post('/update-rating', express.json(), async (req, res) => {
   try {
     const { user_id, album_title, artist, year, genre, cover_url, cover_score, final_score, final_rank, tracks } = req.body;
     if (!user_id || !album_title) return res.status(400).json({ error: 'Faltan datos' });
-    const data = { user_id, album_title, artist, year, genre, cover_url, final_score, final_rank, tracks };
-    if (cover_score !== undefined && cover_score !== '') data.cover_score = parseFloat(cover_score);
+    const data = { user_id, album_title, artist, year, genre, cover_url,
+      final_score: final_score === '' || final_score == null ? null : Number(final_score), final_rank, tracks };
+    if (data.final_score !== null && !Number.isFinite(data.final_score)) return res.status(400).json({ error: 'Score inválido' });
+    if (data.final_score === null) data.cover_score = null;
+    if (data.final_score !== null && cover_score !== undefined && cover_score !== '') data.cover_score = parseFloat(cover_score);
     const result = await saveRating(data);
     res.json({ ok: true, result });
   } catch(err) {
@@ -2385,7 +2388,7 @@ app.get('/public-profile/:discordUsername', async (req, res) => {
         collection = {
           nowPlayingId: null,
           albums: ratingRows.map(row => {
-            const score = Number.parseFloat(row.final_score) || 0;
+            const score = row.final_score == null ? null : Number.parseFloat(row.final_score);
             const rawTracks = Array.isArray(row.tracks) ? row.tracks : [];
             return {
               id: `rating_${row.id}`,
@@ -2396,6 +2399,7 @@ app.get('/public-profile/:discordUsername', async (req, res) => {
               coverUrl: row.cover_url || '',
               score,
               finalRank: row.final_rank || '',
+              tierOnly: score === null && row.final_rank || null,
               tracks: rawTracks.map(track => typeof track === 'string' ? track : track?.name).filter(Boolean),
               trackScores: Object.fromEntries(
                 rawTracks
