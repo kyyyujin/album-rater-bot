@@ -11,7 +11,10 @@ const albumCommandDefinition = {
 
 const ID_VALUE = /^rating:([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})$/i;
 const normalize = value => String(value || '').normalize('NFKD').replace(/\p{M}/gu, '').toLowerCase().replace(/[^\p{L}\p{N}]+/gu, ' ').trim();
-const literal = value => encodeURIComponent('"' + String(value).replace(/\\/g, '\\\\').replace(/"/g, '\\"') + '"');
+// A standalone PostgREST eq filter uses its value literally (pSingleVal).
+// Quoting is for in/or grammar, not eq: eq.%22Kyujin%22 matches a username
+// containing quotes. URL encoding alone keeps this separate query value safe.
+const literal = value => encodeURIComponent(String(value));
 
 // Each full-record lookup re-resolves the immutable Discord ID and filters by
 // owner AND rating ID. Autocomplete IDs never grant access to another account.

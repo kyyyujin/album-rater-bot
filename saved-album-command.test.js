@@ -26,10 +26,32 @@ test('repository resolves immutable Discord ID and owner-scopes the chosen ratin
   await repository.get('123456789', ID);
   assert.match(paths[0], /discord_id=eq\.123456789/);
   const url = new URL('https://example.com/' + paths[1]);
-  assert.equal(url.searchParams.get('user_id'), 'eq."Old \\"Name\\", &"');
+  assert.equal(url.searchParams.get('user_id'), 'eq.Old "Name", &');
   assert.equal(url.searchParams.get('id'), 'eq.' + ID);
   assert.equal(await repository.get('123456789', 'not-a-uuid'), null);
   assert.equal(paths.length, 2);
+});
+
+test('autocomplete and export find real owner values using standalone PostgREST eq semantics', async () => {
+  // PostgREST pSingleVal retains all characters after eq., including quotes.
+  // This adapter would return [] for the previous eq."Kyujin" filter.
+  const owner = 'Kyujin';
+  const repository = createSavedRatingRepository({ read: async path => {
+    const query = new URL('https://example.com/' + path).searchParams;
+    if (path.startsWith('users?')) return query.get('discord_id') === 'eq.123456789' ? [{ username: owner }] : [];
+    if (query.get('user_id')?.slice(3) !== owner) return [];
+    return !query.has('id') || query.get('id') === 'eq.' + ID ? [stored] : [];
+  } });
+  const handle = createSavedAlbumCommand({ logger: quiet, repository, render: async rating => {
+    assert.equal(rating.id, ID);
+    return Buffer.from('PNG');
+  } });
+  const autocomplete = interaction('Album', { autocomplete: true });
+  await handle(autocomplete);
+  assert.equal(autocomplete.calls[0][1][0].value, 'rating:' + ID);
+  const command = interaction(autocomplete.calls[0][1][0].value);
+  await handle(command);
+  assert.equal(command.calls.at(-1)[1].files[0].attachment.toString(), 'PNG');
 });
 
 test('unlinked and ambiguous identity return no catalog or data', async () => {
