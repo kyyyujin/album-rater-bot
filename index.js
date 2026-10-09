@@ -17,6 +17,8 @@ const { normalizeIanaTimezone, localListeningParts } = require('./timezone-utils
 const { classifyEnrichmentError, parseRetryAfter, retryDelayMs } = require('./enrichment-reliability');
 const { createSchedulerPipelines } = require('./scheduler-pipelines');
 const { normalizeDiscordThreadId, discordPostFailure } = require('./discord-posting');
+const { createSavedRatingRepository, createSavedAlbumCommand, ensureAlbumCommand } = require('./saved-album-command');
+const { renderSavedRating } = require('./saved-rating-image');
 
 const app    = express();
 // Render's small instances are memory constrained. libvips must not retain a
@@ -116,15 +118,40 @@ function rankToColor(rank) {
 
 // ── Discord gateway client ──
 const client = new Client({ intents: [GatewayIntentBits.Guilds] });
+const handleSavedAlbum = createSavedAlbumCommand({
+  repository: createSavedRatingRepository({ read: path => sb(path, { timeout: 8000 }) }),
+  render: async rating => {
+    if (ratingExportBusy) {
+      const error = new Error('Rating renderer is busy');
+      error.code = 'RENDER_BUSY';
+      throw error;
+    }
+    ratingExportBusy = true;
+    try {
+      return await renderSavedRating(rating, {
+        launchBrowser: launchRatingExportBrowser,
+        compress: buffer => sharp(buffer).resize({ width: 1440, withoutEnlargement: true }).png({ compressionLevel: 9 }).toBuffer()
+      });
+    } finally { ratingExportBusy = false; }
+  }
+});
 
 client.once('ready', async () => {
   console.log(`Bot online: ${client.user.tag}`);
   client.user.setActivity('rateando álbumes 🎵', { type: 3 }); // WATCHING
-  // Los comandos se registran explícitamente con `npm run register:discord-commands`.
-  // Reescribirlos en cada reinicio del web service genera llamadas innecesarias a Discord.
+  // Add/update only /album; preserve all other commands and avoid writes when
+  // its definition already matches. The explicit registration script also
+  // includes it for fresh installations.
+  try { console.log(`/album ${await ensureAlbumCommand(client.application.commands)}`); }
+  catch (error) { console.error('Could not register /album:', error.code || error.name); }
 });
 
 client.on('interactionCreate', async interaction => {
+  if (interaction.commandName === 'album') {
+    try { await handleSavedAlbum(interaction); }
+    catch (error) { console.error('Album interaction unavailable:', error.code || error.name); }
+    return;
+  }
   if (!interaction.isChatInputCommand()) return;
 
   const discordUsername = interaction.user.username;

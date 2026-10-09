@@ -1,6 +1,7 @@
 'use strict';
 
 const { REST, Routes, SlashCommandBuilder } = require('discord.js');
+const { albumCommandDefinition } = require('./saved-album-command');
 
 const token = process.env.BOT_TOKEN;
 const clientId = process.env.CLIENT_ID;
@@ -26,6 +27,7 @@ const commands = [
     .setDescription('Estadísticas generales de ratings')
     .addStringOption(opt => opt.setName('usuario').setDescription('Nombre de usuario (default: el tuyo)').setRequired(false))
 ].map(command => command.toJSON());
+commands.push(albumCommandDefinition);
 
 new REST({ version: '10' })
   .setToken(token)
