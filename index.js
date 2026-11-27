@@ -1124,8 +1124,16 @@ async function writeArtistAchievementProgress(username, progress) {
 }
 async function persistAchievementCandidates(username, candidates, source, occurredAt) {
   await ensureAchievementDefinitions();
-  const unlocks=[];
+  // Listening and hybrid achievements are reevaluated from durable history on
+  // every sync. Avoid sending an RPC for a (family, level) already unlocked.
+  // The database RPC remains the final concurrency/idempotency authority.
+  const existing=await sb(`vault_achievement_unlocks?user_id=eq.${encodeURIComponent(username)}&select=achievement_key,level`);
+  const known=new Set((existing||[]).map(row=>`${row.achievement_key}:${Number(row.level)}`));
+  const attempted=new Set(), unlocks=[];
   for (const c of candidates || []) {
+    const candidateKey=`${c.key}:${Number(c.level)}`;
+    if(known.has(candidateKey)||attempted.has(candidateKey)) continue;
+    attempted.add(candidateKey);
     const definition=ALL_ACHIEVEMENT_DEFINITIONS.find(d=>d.key===c.key && d.enabled!==false); if(!definition) continue;
     const levelRarity=definition.metadata?.levelRarities?.[c.level-1] || definition.rarity;
     // This object is the immutable Memory Card. Later profile, cover, rating or
@@ -1134,6 +1142,7 @@ async function persistAchievementCandidates(username, candidates, source, occurr
     const inserted=await sb('rpc/achievement_unlock_with_inbox',{method:'POST',body:JSON.stringify({p_user_id:username,p_achievement_key:c.key,p_level:c.level,p_source:source,p_rule_version:definition.ruleVersion,p_snapshot:snapshot,p_unlocked_at:new Date().toISOString()})});
     if(Array.isArray(inserted)&&inserted[0]) {
       unlocks.push(inserted[0]);
+      known.add(candidateKey);
     }
   }
   return unlocks;
